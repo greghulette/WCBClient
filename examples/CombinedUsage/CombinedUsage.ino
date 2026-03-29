@@ -6,14 +6,27 @@
 
   ── What this sketch does ────────────────────────────────────────────────────
   Every 2 seconds : moves servos on two Maestros back and forth using
-                    WCBStream — no serial wire required.
+                    WCBStream broadcast — no serial wire required.
   Every 5 seconds : broadcasts a text command to all WCBs, and sends a
                     unicast text command to WCB1 (if it's online).
   Any time        : prints commands received from the WCB network.
 
+  ── Broadcast is the recommended approach for servo passthrough ───────────────
+  Broadcast uses a single ESP-NOW packet that reaches every WCB at once,
+  keeping latency low and the network uncongested. Unicast is a fine choice
+  for low-frequency operations like triggering a RestartScript, but for
+  continuous position updates or high-rate servo streaming, broadcast gives
+  noticeably better performance. This sketch uses broadcast for Maestro
+  control and unicast only for the text command example.
+
   ── Network credentials ──────────────────────────────────────────────────────
   Fill in the values below to match your WCB system. Find them via the WCB
   Config Tool or by querying a WCB over serial (?WCBM, ?WCBP, ?WCBQ).
+
+  ── WCB setup required for Maestro broadcast ─────────────────────────────────
+  On each WCB that has a Maestro physically wired to it:
+    1. Configure the serial port:   ?MAESTRO,M1:W<n>S<port>:<baud>
+    2. Enable Kyber remote mode:    ?KYBER,REMOTE,S<port>
 */
 
 #include <WCBClient.h>
@@ -30,22 +43,12 @@ const uint8_t WCB_QUANTITY = 4;
 const uint8_t DEVICE_ID    = 20;  // 20 = special out-of-band slot
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Maestro routing — set to match your physical wiring
-//
-// MAESTRO_WCB_x  : WCB number each Maestro is physically wired to
-// MAESTRO_PORT_x : serial port on that WCB connected to the Maestro RX (1–5)
-// MAESTRO_ID_x   : device number from Maestro Control Center (Serial tab)
-//
-// The two Maestros can be on the same WCB or on different WCBs — just set
-// MAESTRO_WCB_1 and MAESTRO_WCB_2 independently.
+// Maestro device numbers — must match the device number configured in
+// Maestro Control Center (Serial Settings tab). Each Maestro responds only
+// to packets addressed to its own device number.
 // ─────────────────────────────────────────────────────────────────────────────
-const uint8_t MAESTRO_WCB_1  = 2;   // WCB2 has the first Maestro
-const uint8_t MAESTRO_PORT_1 = 1;   // wired to Serial1 on WCB2
-const uint8_t MAESTRO_ID_1   = 1;
-
-const uint8_t MAESTRO_WCB_2  = 2;   // change to 3 (or any other WCB) if needed
-const uint8_t MAESTRO_PORT_2 = 2;   // wired to Serial2 on WCB2
-const uint8_t MAESTRO_ID_2   = 2;
+const uint8_t MAESTRO_ID_1 = 1;
+const uint8_t MAESTRO_ID_2 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Callbacks
@@ -66,9 +69,11 @@ void onStatusChanged(uint8_t wcbID, bool online) {
 WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived, onStatusChanged);
 
-// Unicast each stream to its own WCB:port pair
-WCBStream maestroStream1(MAESTRO_WCB_1, MAESTRO_PORT_1);
-WCBStream maestroStream2(MAESTRO_WCB_2, MAESTRO_PORT_2);
+// Broadcast each stream — one ESP-NOW packet reaches every WCB simultaneously.
+// Each MiniMaestro embeds its device number in every packet so only the
+// Maestro with the matching address acts on the command.
+WCBStream maestroStream1(broadcast);
+WCBStream maestroStream2(broadcast);
 
 MiniMaestro maestro1(maestroStream1, Maestro::noResetPin, MAESTRO_ID_1);
 MiniMaestro maestro2(maestroStream2, Maestro::noResetPin, MAESTRO_ID_2);
@@ -95,7 +100,7 @@ void loop() {
 
         maestro1.setTarget(0, pos);
         maestro2.setTarget(0, pos);
-        Serial.printf("[TX] Maestros ch0 → %d (%s)\n", pos,
+        Serial.printf("[TX] Broadcast Maestros ch0 → %d (%s)\n", pos,
                       servoToggle ? "left" : "right");
     }
 

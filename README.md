@@ -202,25 +202,33 @@ MiniMaestro maestro(stream, Maestro::noResetPin, deviceNumber);
 
 ## WCBStream Modes
 
+### Broadcast mode — recommended for servo passthrough
+
+```cpp
+WCBStream stream(broadcast);
+```
+
+Sends raw bytes to all WCBs simultaneously using a single ESP-NOW packet (`sendKyber()`). Each WCB that has `?KYBER,REMOTE` configured on a serial port will forward the bytes to that port. WCBs without Kyber Remote configured ignore the packet.
+
+**Broadcast is the preferred approach for continuous servo control.** Because only one packet is sent regardless of how many Maestros are in the system, the network stays uncongested and latency stays low even at high update rates. Use this when:
+
+- You need continuous position updates or high-rate servo streaming
+- You have Maestros on multiple WCBs and want to address all of them at once
+- You don't know (or don't care) which specific WCB has the Maestro
+- You want one command to ripple out to every servo controller simultaneously
+
+Requires `?KYBER,REMOTE,S<port>` configured on each WCB that has a Maestro wired to it.
+
 ### Unicast mode
 
 ```cpp
 WCBStream stream(2, 1);   // → WCB2, serial port 1
 ```
 
-Sends raw bytes directly to a specific WCB's serial port using `sendRaw()`. The receiving WCB writes the bytes to that port without any special Kyber configuration — it just works. Use this when you know exactly which WCB has the Maestro and which port it's wired to.
+Sends raw bytes directly to one specific WCB's serial port using `sendRaw()`. The receiving WCB writes the bytes to that port without any special Kyber configuration — it just works. Unicast is perfectly acceptable for low-frequency operations like triggering a `RestartScript` on a known target, but for continuous servo streaming broadcast will give noticeably better performance. Use unicast when:
 
-### Broadcast mode
-
-```cpp
-WCBStream stream(broadcast);
-```
-
-Sends raw bytes to all WCBs simultaneously using `sendKyber()`. Each WCB that has `?KYBER,REMOTE` configured on a serial port will forward the bytes to that port. WCBs without Kyber Remote configured ignore the packet. Use this when:
-
-- You have Maestros on multiple WCBs and want to address all of them at once
-- You don't know (or don't care) which specific WCB has the Maestro
-- You want one command to ripple out to every servo controller simultaneously
+- You need to target one specific WCB:port and broadcast is not an option
+- You are sending infrequent commands (script triggers, one-shot moves) rather than a continuous stream
 
 ---
 

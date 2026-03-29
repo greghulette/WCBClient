@@ -6,10 +6,19 @@
   Maestro wired up and Kyber_Remote configured will execute the command.
   WCBs without a Maestro ignore it.
 
+  ── Broadcast is the recommended approach for servo passthrough ───────────────
+  Broadcast uses a single ESP-NOW packet that reaches every WCB at once,
+  keeping latency low and the network uncongested regardless of how many
+  Maestros are in the system. Unicast (MaestroUnicast) is a fine choice for
+  low-frequency operations like triggering a RestartScript, but for continuous
+  position updates or high-rate servo streaming, broadcast will give you
+  noticeably better performance.
+
   Use this when:
     - You have Maestros on multiple WCBs and want to address all of them
     - You don't know (or don't care) which specific WCB has the Maestro
     - You want one command to ripple out to every servo controller at once
+    - You need the best possible throughput for continuous servo updates
 
   For sending to one specific WCB:port, see MaestroUnicast.
 
@@ -39,16 +48,18 @@ const uint8_t WCB_QUANTITY = 4;
 const uint8_t DEVICE_ID    = 20;  // 20 = special out-of-band slot
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Maestro device number
+// Maestro device numbers
 //
-// Set this to match the device number configured in Maestro Control Center
+// Set each to match the device number configured in Maestro Control Center
 // (Serial Settings tab). This enables the Pololu protocol so each packet
-// includes the 0xAA start byte and the device number — required when your
-// show controller addresses Maestros by number.
+// includes the 0xAA start byte and the device number — the correct Maestro
+// responds to its own address and ignores packets addressed to others.
 //
-// Use Maestro::deviceNumberDefault (255) for the compact protocol instead.
+// Use Maestro::deviceNumberDefault (255) for the compact protocol instead
+// (only suitable when there is exactly one Maestro on the network).
 // ─────────────────────────────────────────────────────────────────────────────
-const uint8_t MAESTRO_DEVICE = 1;
+const uint8_t MAESTRO_ID_1 = 1;
+const uint8_t MAESTRO_ID_2 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WCBClient and WCBStream — broadcast mode
@@ -56,14 +67,20 @@ const uint8_t MAESTRO_DEVICE = 1;
 // WCBClient must be declared BEFORE WCBStream. Passing  broadcast  as the
 // target tells WCBStream to use sendKyber() — one ESP-NOW packet reaches
 // every WCB; those with Kyber_Remote forward the bytes to their Maestro.
+//
+// Each stream carries commands for a different Maestro device number.
+// Because each MiniMaestro embeds its own device address in every packet,
+// only the Maestro with the matching device number will act on the command.
 // ─────────────────────────────────────────────────────────────────────────────
 WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
-WCBStream maestroStream(broadcast);   // broadcast to all WCBs with Maestros
+WCBStream maestroStream1(broadcast);
+WCBStream maestroStream2(broadcast);
 
 // Pass WCBStream to the Pololu library instead of a hardware serial port.
 // The Pololu library writes bytes here; WCBStream forwards them wirelessly.
-MiniMaestro maestro(maestroStream, Maestro::noResetPin, MAESTRO_DEVICE);
+MiniMaestro maestro1(maestroStream1, Maestro::noResetPin, MAESTRO_ID_1);
+MiniMaestro maestro2(maestroStream2, Maestro::noResetPin, MAESTRO_ID_2);
 
 unsigned long lastMoveMs = 0;
 
@@ -73,11 +90,12 @@ void setup() {
 }
 
 void loop() {
-    // update() drives heartbeats and flushes WCBStream automatically.
+    // update() drives heartbeats and flushes both WCBStreams automatically.
     wcb.update();
 
-    // Sweep servo channel 0 back and forth every 2 seconds.
-    // The same command reaches every WCB with a Maestro simultaneously.
+    // Sweep both servo channel 0s back and forth every 2 seconds.
+    // Each command reaches every WCB with a Maestro simultaneously;
+    // the device number in each packet ensures the right Maestro responds.
     if (millis() - lastMoveMs >= 2000) {
         lastMoveMs = millis();
         static bool toggle = false;
@@ -85,8 +103,9 @@ void loop() {
 
         // Quarter-microseconds: 4000=1000µs  6000=1500µs  8000=2000µs
         uint16_t pos = toggle ? 4000 : 8000;
-        maestro.setTarget(0, pos);
-        Serial.printf("[TX] Broadcast Maestro ch0 → %d (%s)\n",
+        maestro1.setTarget(0, pos);
+        maestro2.setTarget(0, pos);
+        Serial.printf("[TX] Broadcast Maestros ch0 → %d (%s)\n",
                       pos, toggle ? "left" : "right");
     }
 }
