@@ -29,6 +29,36 @@ This library lets any ESP32 — a Kyber controller, a custom prop brain, a stage
 
 ---
 
+## Dependencies
+
+**WCBClient itself has no external dependencies** — it uses only built-in ESP32 Arduino libraries (`WiFi.h`, `esp_now.h`).
+
+**If you are using WCBStream for Maestro control**, you also need:
+
+- **PololuMaestro** by Pololu — install via **Sketch → Include Library → Manage Libraries...**, search `PololuMaestro`
+
+---
+
+## Network Credentials
+
+All devices on the same WCB network must share four values. Find them by querying any WCB over serial or using the WCB Config Tool:
+
+| Parameter | WCB Command | Description |
+|-----------|-------------|-------------|
+| `mac_oct2` | `?WCBM` | MAC address octet 2 identifying the network |
+| `mac_oct3` | `?WCBM` | MAC address octet 3 identifying the network |
+| `password` | `?WCBP` | ESP-NOW network password |
+| `wcb_quantity` | `?WCBQ` | Total number of WCB boards |
+
+---
+
+## Device ID Notes
+
+- IDs **1 through `wcb_quantity`** are standard WCB slots. WCB boards pre-register these MACs so packets arrive correctly. Your device ID must be ≤ `wcb_quantity`.
+- ID **20** is the special out-of-band slot — it doesn't consume a WCB number and works even if `wcb_quantity` is less than 20, but requires `?SPECIAL,ON` to be set on the WCB boards.
+
+---
+
 ## Quick Start
 
 ### Send and receive text commands
@@ -36,10 +66,18 @@ This library lets any ESP32 — a Kyber controller, a custom prop brain, a stage
 ```cpp
 #include <WCBClient.h>
 
-WCBClient wcb(0x22, 0x33, "my_network_password", /*quantity=*/4, /*deviceID=*/20,
-              [](uint8_t sender, const char* cmd) {
-                  Serial.printf("From WCB%d: %s\n", sender, cmd);
-              });
+const uint8_t MAC_OCT2     = 0x5C;
+const uint8_t MAC_OCT3     = 0x57;
+const char*   PASSWORD     = "MyNetworkPassword";
+const uint8_t WCB_QUANTITY = 3;
+const uint8_t DEVICE_ID    = 20;
+
+void onCommandReceived(uint8_t sender, const char* cmd) {
+    Serial.printf("From WCB%d: %s\n", sender, cmd);
+}
+
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+              onCommandReceived);
 
 void setup() {
     Serial.begin(115200);
@@ -47,23 +85,54 @@ void setup() {
 }
 
 void loop() {
-    wcb.update();                    // must call every loop — drives heartbeats
-    wcb.broadcast(";m11");          // send to all WCBs at once
-    wcb.send(2, ":PP100");          // send to WCB2 only
+    wcb.update();              // must call every loop — drives heartbeats
+    wcb.broadcast(":PP100");   // send to all WCBs at once
+    wcb.send(2, ":LEDON");     // send to WCB2 only
     delay(5000);
 }
 ```
 
-### Forward Maestro servo commands wirelessly
+### Forward Maestro servo commands wirelessly — unicast
+
+Send to one specific WCB and serial port. No special configuration needed on the receiving WCB.
 
 ```cpp
 #include <WCBClient.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>
 
-WCBClient wcb(0x22, 0x33, "my_network_password", 4, 20);
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
-// broadcast — every WCB with a Maestro wired up will receive it
+// WCBClient must be declared before WCBStream
+WCBStream maestroStream(2, 1);   // → WCB2, serial port 1
+MiniMaestro maestro(maestroStream, Maestro::noResetPin, /*deviceID=*/1);
+
+void setup() {
+    Serial.begin(115200);
+    wcb.begin();
+}
+
+void loop() {
+    wcb.update();                    // also flushes WCBStream automatically
+    maestro.setTarget(0, 6000);      // 1500µs — centre position
+    delay(1000);
+    maestro.setTarget(0, 4000);      // 1000µs — full left
+    delay(1000);
+}
+```
+
+### Forward Maestro servo commands wirelessly — broadcast
+
+Send to every WCB that has a Maestro configured. Requires `?KYBER,REMOTE` on each receiving WCB.
+
+```cpp
+#include <WCBClient.h>
+#include <WCBStream.h>
+#include <PololuMaestro.h>
+
+WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+
+// broadcast — every WCB with ?KYBER,REMOTE configured will receive it
 WCBStream maestroStream(broadcast);
 MiniMaestro maestro(maestroStream, Maestro::noResetPin, /*deviceID=*/1);
 
@@ -73,10 +142,8 @@ void setup() {
 }
 
 void loop() {
-    wcb.update();                        // also flushes WCBStream automatically
-    maestro.setTarget(0, 6000);          // 1500µs — centre position
-    delay(1000);
-    maestro.setTarget(0, 4000);          // 1000µs — full left
+    wcb.update();
+    maestro.setTarget(0, 6000);   // reaches all configured Maestros simultaneously
     delay(1000);
 }
 ```
@@ -89,13 +156,13 @@ void loop() {
 
 | Method | Description |
 |--------|-------------|
-| `WCBClient(oct2, oct3, password, quantity, deviceID, [cmdCb], [statusCb])` | Constructor. `deviceID` must match your WCB system (1–19 within quantity, or 20 for the out-of-band special slot). |
+| `WCBClient(oct2, oct3, password, quantity, deviceID, [cmdCb], [statusCb])` | Constructor. `deviceID` must match your WCB system (1–`quantity` for a standard slot, or `20` for the out-of-band special slot). |
 | `begin()` | Initialize WiFi and ESP-NOW, set custom MAC, register peers. Call once from `setup()`. |
 | `update()` | Call every `loop()`. Drives heartbeats, offline detection, and WCBStream flushing. |
 | `send(wcbID, command)` | Unicast a text command to one WCB. |
 | `broadcast(command)` | Broadcast a text command to all WCBs simultaneously. |
-| `sendRaw(wcbID, port, data, len)` | Unicast raw bytes to a specific WCB's serial port (e.g., for a directly-wired Maestro). |
-| `sendKyber(data, len)` | Broadcast raw bytes to all WCBs — any with Kyber_Remote will forward to their Maestro. |
+| `sendRaw(wcbID, port, data, len)` | Unicast raw bytes to a specific WCB's serial port. |
+| `sendKyber(data, len)` | Broadcast raw bytes to all WCBs — any with `?KYBER,REMOTE` will forward to their Maestro. |
 | `monitorRaw(serial, target, port, [gap_ms])` | Watch a UART; flush buffered bytes via `sendRaw()` or `sendKyber()` (pass `broadcast` as target) when silent for `gap_ms`. |
 | `monitorSerial(serial, target, [terminator])` | Watch a UART for newline-terminated text commands; forward each line via `send()` or `broadcast()`. |
 | `isOnline(wcbID)` | Returns `true` if the specified WCB has sent a heartbeat recently. |
@@ -107,10 +174,12 @@ void loop() {
 
 A `Stream` adapter that intercepts writes from the Pololu Maestro library and forwards them wirelessly instead of to a physical serial port.
 
+**WCBClient must be declared before WCBStream at global scope.** WCBStream self-registers with WCBClient on construction so `wcb.update()` flushes all streams automatically — no extra calls needed in `loop()`.
+
 ```cpp
-WCBStream stream(broadcast);        // broadcast to all WCBs with Kyber_Remote
-WCBStream stream(wcbID, port);      // unicast to a specific WCB:port
-WCBStream stream(wcbID, port, 5);   // unicast with 5ms inter-frame gap
+WCBStream stream(broadcast);         // broadcast to all WCBs with Kyber_Remote
+WCBStream stream(wcbID, port);       // unicast to a specific WCB:port
+WCBStream stream(wcbID, port, 5);    // unicast with 5ms inter-frame gap
 ```
 
 Pass the `WCBStream` to the Pololu library in place of a serial port:
@@ -118,8 +187,6 @@ Pass the `WCBStream` to the Pololu library in place of a serial port:
 ```cpp
 MiniMaestro maestro(stream, Maestro::noResetPin, deviceNumber);
 ```
-
-`wcb.update()` flushes all streams automatically — no extra code needed in `loop()`.
 
 ### Constants
 
@@ -133,24 +200,60 @@ MiniMaestro maestro(stream, Maestro::noResetPin, deviceNumber);
 
 ---
 
-## Network Credentials
+## WCBStream Modes
 
-All devices on the same WCB network must share:
+### Unicast mode
 
-| Parameter | WCB Command | Description |
-|-----------|-------------|-------------|
-| `mac_oct2` / `mac_oct3` | `?WCBM` | MAC address octets 2 and 3 identifying the network |
-| `password` | `?WCBP` | ESP-NOW network password |
-| `wcb_quantity` | `?WCBQ` | Total number of WCB boards |
+```cpp
+WCBStream stream(2, 1);   // → WCB2, serial port 1
+```
 
-Query any WCB over serial or use the WCB Config Tool to find these values.
+Sends raw bytes directly to a specific WCB's serial port using `sendRaw()`. The receiving WCB writes the bytes to that port without any special Kyber configuration — it just works. Use this when you know exactly which WCB has the Maestro and which port it's wired to.
+
+### Broadcast mode
+
+```cpp
+WCBStream stream(broadcast);
+```
+
+Sends raw bytes to all WCBs simultaneously using `sendKyber()`. Each WCB that has `?KYBER,REMOTE` configured on a serial port will forward the bytes to that port. WCBs without Kyber Remote configured ignore the packet. Use this when:
+
+- You have Maestros on multiple WCBs and want to address all of them at once
+- You don't know (or don't care) which specific WCB has the Maestro
+- You want one command to ripple out to every servo controller simultaneously
 
 ---
 
-## Device ID Notes
+## Maestro Device Number
 
-- IDs **1 through `wcb_quantity`** are standard WCB slots. The WCB boards pre-register these MACs so packets arrive correctly. Your device ID must be ≤ `wcb_quantity`.
-- ID **20** is the special out-of-band slot — it doesn't consume a WCB number and works even if `wcb_quantity` is less than 20, but requires `?SPECIAL,ON` to be set on the WCB boards.
+The third argument to `MiniMaestro` corresponds to the **Device Number** in Maestro Control Center → **Serial Settings**. It enables the Pololu protocol so each packet includes the `0xAA` start byte and device address.
+
+```cpp
+// Compact protocol — one Maestro, no device addressing
+MiniMaestro maestro(stream, Maestro::noResetPin, Maestro::deviceNumberDefault);
+
+// Pololu protocol — device number 1
+MiniMaestro maestro(stream, Maestro::noResetPin, 1);
+```
+
+Quarter-microsecond values for common servo positions:
+
+| µs | Quarter-µs | Position |
+|----|-----------|----------|
+| 1000 | 4000 | Full left / min |
+| 1500 | 6000 | Centre |
+| 2000 | 8000 | Full right / max |
+
+---
+
+## Checksum Setting
+
+The library appends a CRC32 checksum to every outgoing command and verifies checksums on incoming commands. This must match the `?ETM,CHKSM` setting on all WCBs. The default on both the library and WCB firmware is **ON**.
+
+```cpp
+wcb.setChecksum(true);    // Default — matches WCB factory default
+wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
+```
 
 ---
 
@@ -159,8 +262,8 @@ Query any WCB over serial or use the WCB Config Tool to find these values.
 | Example | Description |
 |---------|-------------|
 | `BasicUsage` | Send and receive text commands |
-| `MaestroUnicast` | Forward Maestro commands to a specific WCB:port |
-| `MaestroBroadcast` | Broadcast Maestro commands to all WCBs with Maestros |
+| `MaestroUnicast` | Forward Maestro commands to a specific WCB:port (unicast) |
+| `MaestroBroadcast` | Broadcast Maestro commands to all WCBs with Maestros configured |
 | `CombinedUsage` | Text commands and Maestro forwarding running simultaneously |
 
 ---

@@ -32,14 +32,19 @@ const uint8_t DEVICE_ID    = 20;  // 20 = special out-of-band slot
 // ─────────────────────────────────────────────────────────────────────────────
 // Maestro routing — set to match your physical wiring
 //
-// MAESTRO_WCB    : WCB number the Maestros are connected to (for unicast)
-// MAESTRO_PORT_x : serial port on that WCB wired to each Maestro (1–5)
+// MAESTRO_WCB_x  : WCB number each Maestro is physically wired to
+// MAESTRO_PORT_x : serial port on that WCB connected to the Maestro RX (1–5)
 // MAESTRO_ID_x   : device number from Maestro Control Center (Serial tab)
+//
+// The two Maestros can be on the same WCB or on different WCBs — just set
+// MAESTRO_WCB_1 and MAESTRO_WCB_2 independently.
 // ─────────────────────────────────────────────────────────────────────────────
-const uint8_t MAESTRO_WCB    = 2;
-const uint8_t MAESTRO_PORT_1 = 1;
+const uint8_t MAESTRO_WCB_1  = 2;   // WCB2 has the first Maestro
+const uint8_t MAESTRO_PORT_1 = 1;   // wired to Serial1 on WCB2
 const uint8_t MAESTRO_ID_1   = 1;
-const uint8_t MAESTRO_PORT_2 = 2;
+
+const uint8_t MAESTRO_WCB_2  = 2;   // change to 3 (or any other WCB) if needed
+const uint8_t MAESTRO_PORT_2 = 2;   // wired to Serial2 on WCB2
 const uint8_t MAESTRO_ID_2   = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,9 +66,9 @@ void onStatusChanged(uint8_t wcbID, bool online) {
 WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived, onStatusChanged);
 
-// Unicast each stream to a specific WCB:port pair
-WCBStream maestroStream1(MAESTRO_WCB, MAESTRO_PORT_1);
-WCBStream maestroStream2(MAESTRO_WCB, MAESTRO_PORT_2);
+// Unicast each stream to its own WCB:port pair
+WCBStream maestroStream1(MAESTRO_WCB_1, MAESTRO_PORT_1);
+WCBStream maestroStream2(MAESTRO_WCB_2, MAESTRO_PORT_2);
 
 MiniMaestro maestro1(maestroStream1, Maestro::noResetPin, MAESTRO_ID_1);
 MiniMaestro maestro2(maestroStream2, Maestro::noResetPin, MAESTRO_ID_2);
