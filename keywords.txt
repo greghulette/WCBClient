@@ -1,10 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# WCBClient library keywords
+# WCB_Client library keywords
 # Format: <name> <TAB> <type>
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Classes (KEYWORD1)
-WCBClient	KEYWORD1
+WCB_Client	KEYWORD1
 WCBStream	KEYWORD1
 
 # Type aliases / callbacks (KEYWORD1)

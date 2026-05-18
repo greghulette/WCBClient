@@ -1,5 +1,5 @@
 /*
-  MaestroUnicast.ino — WCBClient + WCBStream Example
+  MaestroUnicast.ino — WCB_Client + WCBStream Example
 
   Demonstrates forwarding Pololu Maestro servo commands to a SPECIFIC WCB's
   serial port over the WCB ESP-NOW network — no serial wire, no hardware
@@ -21,7 +21,7 @@
   Config Tool or by querying a WCB over serial (?WCBM, ?WCBP, ?WCBQ).
 */
 
-#include <WCBClient.h>
+#include <WCB_Client.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>  // Pololu Maestro library by Pololu
 
@@ -51,16 +51,16 @@ const uint8_t MAESTRO_PORT_2 = 2;   // wired to Serial2 on WCB2
 const uint8_t MAESTRO_ID_2   = 2;   // Maestro device number 2
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WCBClient and WCBStream instances
+// WCB_Client and WCBStream instances
 //
-// WCBClient must be declared BEFORE WCBStream at global scope. Its constructor
+// WCB_Client must be declared BEFORE WCBStream at global scope. Its constructor
 // sets the singleton so WCBStream can find it automatically — no need to pass
 // wcb as a parameter.
 //
-// Each WCBStream self-registers with WCBClient so wcb.update() flushes them
+// Each WCBStream self-registers with WCB_Client so wcb.update() flushes them
 // automatically. Up to 4 streams are supported simultaneously.
 // ─────────────────────────────────────────────────────────────────────────────
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
 WCBStream maestroStream1(MAESTRO_WCB_1, MAESTRO_PORT_1);  // → WCB2 Serial1 → Maestro 1
 WCBStream maestroStream2(MAESTRO_WCB_2, MAESTRO_PORT_2);  // → WCB2 Serial2 → Maestro 2

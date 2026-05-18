@@ -1,4 +1,4 @@
-# WCBClient
+# WCB_Client
 
 An Arduino library for ESP32 devices that lets them join a [Wireless Communication Board (WCB)](https://github.com/greghulette/Wireless_Communication_Board-WCB) ESP-NOW network as a first-class peer — sending commands, receiving commands, forwarding raw bytes to Pololu Maestro servo controllers, and participating in the ETM heartbeat system.
 
@@ -31,7 +31,7 @@ This library lets any ESP32 — a Kyber controller, a custom prop brain, a stage
 
 ## Dependencies
 
-**WCBClient itself has no external dependencies** — it uses only built-in ESP32 Arduino libraries (`WiFi.h`, `esp_now.h`).
+**WCB_Client itself has no external dependencies** — it uses only built-in ESP32 Arduino libraries (`WiFi.h`, `esp_now.h`).
 
 **If you are using WCBStream for Maestro control**, you also need:
 
@@ -64,7 +64,7 @@ All devices on the same WCB network must share four values. Find them by queryin
 ### Send and receive text commands
 
 ```cpp
-#include <WCBClient.h>
+#include <WCB_Client.h>
 
 const uint8_t MAC_OCT2     = 0x5C;
 const uint8_t MAC_OCT3     = 0x57;
@@ -76,7 +76,7 @@ void onCommandReceived(uint8_t sender, const char* cmd) {
     Serial.printf("From WCB%d: %s\n", sender, cmd);
 }
 
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived);
 
 void setup() {
@@ -97,13 +97,13 @@ void loop() {
 Send to one specific WCB and serial port. The receiving WCB writes the bytes directly to the requested port — **no `?KYBER,REMOTE` configuration is required**. The `?KYBER,REMOTE` flag is only checked on the broadcast path; unicast bypasses it entirely.
 
 ```cpp
-#include <WCBClient.h>
+#include <WCB_Client.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>
 
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
-// WCBClient must be declared before WCBStream
+// WCB_Client must be declared before WCBStream
 WCBStream maestroStream(2, 1);   // → WCB2, serial port 1
 MiniMaestro maestro(maestroStream, Maestro::noResetPin, /*deviceID=*/1);
 
@@ -126,11 +126,11 @@ void loop() {
 Send to every WCB that has a Maestro configured. Requires `?KYBER,REMOTE` on each receiving WCB.
 
 ```cpp
-#include <WCBClient.h>
+#include <WCB_Client.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>
 
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
 // broadcast — every WCB with ?KYBER,REMOTE configured will receive it
 WCBStream maestroStream(broadcast);
@@ -152,11 +152,11 @@ void loop() {
 
 ## API Reference
 
-### WCBClient
+### WCB_Client
 
 | Method | Description |
 |--------|-------------|
-| `WCBClient(oct2, oct3, password, quantity, deviceID, [cmdCb], [statusCb])` | Constructor. `deviceID` must match your WCB system (1–`quantity` for a standard slot, or `20` for the out-of-band special slot). |
+| `WCB_Client(oct2, oct3, password, quantity, deviceID, [cmdCb], [statusCb])` | Constructor. `deviceID` must match your WCB system (1–`quantity` for a standard slot, or `20` for the out-of-band special slot). |
 | `begin()` | Initialize WiFi and ESP-NOW, set custom MAC, register peers. Call once from `setup()`. |
 | `update()` | Call every `loop()`. Drives heartbeats, offline detection, and WCBStream flushing. |
 | `send(wcbID, command)` | Unicast a text command to one WCB. |
@@ -174,7 +174,7 @@ void loop() {
 
 A `Stream` adapter that intercepts writes from the Pololu Maestro library and forwards them wirelessly instead of to a physical serial port.
 
-**WCBClient must be declared before WCBStream at global scope.** WCBStream self-registers with WCBClient on construction so `wcb.update()` flushes all streams automatically — no extra calls needed in `loop()`.
+**WCB_Client must be declared before WCBStream at global scope.** WCBStream self-registers with WCB_Client on construction so `wcb.update()` flushes all streams automatically — no extra calls needed in `loop()`.
 
 ```cpp
 WCBStream stream(broadcast);         // broadcast to all WCBs with Kyber_Remote
@@ -265,15 +265,15 @@ void onStatusChanged(uint8_t wcbID, bool online) {
 
 ```cpp
 // Command callback only
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived);
 
 // Status callback only
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               nullptr, onStatusChanged);
 
 // Both
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived, onStatusChanged);
 ```
 
@@ -291,7 +291,7 @@ This is useful when your callback logic depends on objects that are not yet init
 Both callbacks also accept lambdas for compact inline definitions:
 
 ```cpp
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
     [](uint8_t sender, const char* cmd) {
         Serial.printf("From WCB%d: %s\n", sender, cmd);
     },

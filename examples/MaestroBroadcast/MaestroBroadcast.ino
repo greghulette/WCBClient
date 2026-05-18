@@ -1,5 +1,5 @@
 /*
-  MaestroBroadcast.ino — WCBClient + WCBStream Broadcast Example
+  MaestroBroadcast.ino — WCB_Client + WCBStream Broadcast Example
 
   Demonstrates broadcasting Pololu Maestro servo commands to ALL WCBs on the
   network simultaneously using the  broadcast  constant. Any WCB that has a
@@ -34,7 +34,7 @@
   WCB Config Tool or by querying a WCB over serial (?WCBM, ?WCBP, ?WCBQ).
 */
 
-#include <WCBClient.h>
+#include <WCB_Client.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>  // Pololu Maestro library by Pololu
 
@@ -62,9 +62,9 @@ const uint8_t MAESTRO_ID_1 = 1;
 const uint8_t MAESTRO_ID_2 = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WCBClient and WCBStream — broadcast mode
+// WCB_Client and WCBStream — broadcast mode
 //
-// WCBClient must be declared BEFORE WCBStream. Passing  broadcast  as the
+// WCB_Client must be declared BEFORE WCBStream. Passing  broadcast  as the
 // target tells WCBStream to use sendKyber() — one ESP-NOW packet reaches
 // every WCB; those with Kyber_Remote forward the bytes to their Maestro.
 //
@@ -72,7 +72,7 @@ const uint8_t MAESTRO_ID_2 = 2;
 // Because each MiniMaestro embeds its own device address in every packet,
 // only the Maestro with the matching device number will act on the command.
 // ─────────────────────────────────────────────────────────────────────────────
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 
 WCBStream maestroStream1(broadcast);
 WCBStream maestroStream2(broadcast);

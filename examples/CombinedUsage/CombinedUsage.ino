@@ -1,5 +1,5 @@
 /*
-  CombinedUsage.ino — WCBClient + WCBStream Combined Example
+  CombinedUsage.ino — WCB_Client + WCBStream Combined Example
 
   Demonstrates text command sending/receiving AND Pololu Maestro servo
   forwarding running simultaneously on the same ESP32.
@@ -29,7 +29,7 @@
     2. Enable Kyber remote mode:    ?KYBER,REMOTE,S<port>
 */
 
-#include <WCBClient.h>
+#include <WCB_Client.h>
 #include <WCBStream.h>
 #include <PololuMaestro.h>
 
@@ -62,11 +62,11 @@ void onStatusChanged(uint8_t wcbID, bool online) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WCBClient must be declared before any WCBStream objects.
-// WCBStream self-registers with WCBClient on construction so wcb.update()
+// WCB_Client must be declared before any WCBStream objects.
+// WCBStream self-registers with WCB_Client on construction so wcb.update()
 // flushes all streams automatically — no extra calls needed in loop().
 // ─────────────────────────────────────────────────────────────────────────────
-WCBClient wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
+WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID,
               onCommandReceived, onStatusChanged);
 
 // Broadcast each stream — one ESP-NOW packet reaches every WCB simultaneously.
