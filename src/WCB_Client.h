@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <atomic>
 
 // Forward declaration — WCBStream is defined in WCBStream.h.
 // Keeps this header self-contained; users include WCBStream.h only when needed.
@@ -368,8 +369,13 @@ private:
     WCBPending     _pending[WCB_PENDING_MAX]; // In-flight commands awaiting ACK
 
     // ── ETM state ────────────────────────────────────────────────────────────
-    uint16_t      _seqCounter;       // Monotonically increasing sequence number;
-                                     // incremented for each COMMAND packet sent
+    // Atomic: the sequence number is incremented from BOTH cores — the main
+    // loop (send()/broadcast() via the application) AND the ESP-NOW receive
+    // callback (WiFi task), since the command callback may reply with send().
+    // A non-atomic ++ races and can hand the same sequence number to two
+    // packets, causing the receiver's duplicate-detection to silently drop
+    // one of them.  std::atomic<uint16_t> is lock-free on Xtensa.
+    std::atomic<uint16_t> _seqCounter;  // monotonic per-COMMAND sequence number
     unsigned long _nextHeartbeatMs;  // millis() when the next heartbeat is due
 
     // ETM timing — defaults match WCB firmware factory defaults.

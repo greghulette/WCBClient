@@ -147,6 +147,17 @@ void WCB_Client::update() {
 
     _checkOfflineBoards();
     _processMonitors();
+
+    // Reclaim stale pending slots — a unicast whose ACK never arrives would
+    // otherwise hold its slot indefinitely. This is reclaim only, NOT retry:
+    // the library does not retransmit (ESP-NOW unicast already retries at the
+    // MAC layer). 1 s is well beyond a normal ACK round-trip, so any slot
+    // older than that is presumed lost and freed for reuse.
+    for (int i = 0; i < WCB_PENDING_MAX; i++) {
+        if (_pending[i].active && (now - _pending[i].sentMs) > 1000UL) {
+            _pending[i].active = false;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -583,13 +594,20 @@ bool WCB_Client::_sendPacket(uint8_t targetID, const char* command) {
 
     // Record in the pending table so we can match an incoming ACK back to this
     // packet. If all slots are full the packet is still sent — just not tracked.
-    int slot = _findFreePending();
+    //
+    // Broadcasts are fire-and-forget and are NOT tracked: the ACK handler
+    // deliberately never frees broadcast slots (it keeps collecting ACKs from
+    // multiple boards), so recording them would permanently fill the small
+    // WCB_PENDING_MAX table within seconds of normal broadcasting and starve
+    // unicast ACK-tracking. Only unicasts get a slot.
+    int slot = (targetID == WCB_TARGET_BROADCAST) ? -1 : _findFreePending();
     if (slot >= 0) {
         _pending[slot].active   = true;
         _pending[slot].seqNum   = pkt.structSequenceNumber;
         _pending[slot].sentMs   = millis();
         _pending[slot].targetID = targetID;
         strncpy(_pending[slot].command, command, sizeof(_pending[slot].command) - 1);
+        _pending[slot].command[sizeof(_pending[slot].command) - 1] = '\0';  // strncpy may not NUL-terminate
         memset(_pending[slot].ackReceived, 0, sizeof(_pending[slot].ackReceived));
     }
 
