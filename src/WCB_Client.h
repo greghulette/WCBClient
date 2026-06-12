@@ -139,6 +139,29 @@ typedef struct __attribute__((packed)) {
 } wcb_packet_etm_t;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MGMT fragmentation packet (226 bytes, packed) — used for AUTOMATIC
+// fragmentation of unicast commands longer than the single-packet limit.
+// Must stay byte-identical to the WCB firmware's espnow_struct_mgmt: the
+// firmware dispatches incoming ESP-NOW packets BY SIZE (226 → MGMT reassembly),
+// reassembles the chunks per sessionId, and executes the full command through
+// its normal parser. Duplicate chunks are idempotent; completed sessions are
+// remembered, so retransmitted passes are safely discarded.
+// ─────────────────────────────────────────────────────────────────────────────
+#define WCB_MGMT_PACKET_TYPE_FRAG  3     // firmware PACKET_TYPE_MGMT_FRAG
+#define WCB_MGMT_MAX_CHUNKS        16    // firmware MGMT_MAX_CHUNKS (uint16 mask)
+#define WCB_MGMT_CHUNK_LEN         179   // payload[180] minus NUL (firmware strncpy)
+
+typedef struct __attribute__((packed)) {
+    char     structPassword[40];   // network password — must match all peers
+    uint8_t  packetType;           // WCB_MGMT_PACKET_TYPE_FRAG
+    uint8_t  targetWCB;            // board this session is addressed to
+    uint16_t sessionId;            // ties all chunks of one command together
+    uint8_t  chunkIdx;             // 0-based chunk index
+    uint8_t  totalChunks;          // total chunks in this session
+    char     payload[180];         // command-string fragment
+} wcb_packet_mgmt_t;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal state types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -246,8 +269,18 @@ public:
 
     // Send a text command to one specific WCB.
     // target_wcb : WCB number to address (1–WCB_MAX_BOARDS)
-    // command    : null-terminated command string (max ~188 chars with checksum,
-    //              200 chars without — matching ?ETM,CHKSM setting on WCBs)
+    // command    : null-terminated command string. Fits-in-one-packet limit is
+    //              199 chars (187 with checksum enabled — the |CRCxxxxxxxx
+    //              suffix shares the same 200-byte field).
+    //              LONGER commands are fragmented AUTOMATICALLY (since 1.3.0):
+    //              the library splits them into MGMT chunks that the target WCB
+    //              reassembles and executes whole — long ?SEQ,SAVE sequences
+    //              just work, up to ~2.8 KB (16 chunks × 179 chars).
+    //              Fragmented delivery has NO per-chunk ACK at the firmware
+    //              layer; the library compensates by transmitting each chunk
+    //              multiple times (3 passes when ensured, 2 otherwise —
+    //              duplicates are harmless, the target dedups by session).
+    //              A fragmented send blocks for ~10 ms per chunk per pass.
     // ensured    : true (default) → application-layer ETM ensured delivery:
     //              retransmit (reusing the sequence number) until the target
     //              ACKs at the ETM layer, up to ETM_MAX_RETRIES. This matches
@@ -261,6 +294,11 @@ public:
 
     // Broadcast a text command to ALL WCBs on the network simultaneously.
     // Sends one ESP-NOW packet to the shared broadcast MAC; every WCB receives it.
+    // SIZE LIMIT: broadcast does NOT fragment — commands longer than the
+    // single-packet limit (199 chars / 187 with checksum) FAIL with an error
+    // log and return false. Fragmentation is unicast-only (the reassembly
+    // session on the target is per-board): send() the long command to each
+    // board individually instead.
     // ensured : true (default) → ENSURED broadcast: the packet is retransmitted
     //           (per-board unicast, reusing the sequence number) until every
     //           board that was online at send time has ACK'd at the ETM layer
@@ -489,6 +527,16 @@ private:
     // broadcast), snapshots the expected-recipient set for ensured sends, then
     // transmits via _transmit().
     bool _sendPacket(uint8_t targetID, const char* command, bool ensured);
+
+    // Automatic fragmentation for unicast commands longer than the
+    // single-packet limit: splits into WCB_MGMT_CHUNK_LEN chunks, broadcasts
+    // them as wcb_packet_mgmt_t with a fresh sessionId, and repeats the full
+    // set (3 passes when ensured, 2 otherwise) to compensate for the lack of
+    // per-chunk ACKs. The target reassembles + executes the whole command.
+    bool _sendFragmented(uint8_t target_wcb, const char* command, bool ensured);
+
+    // Max command chars that fit a single packet given the checksum setting.
+    size_t _maxSingleCommandLen() const;
 
     // Build + transmit a COMMAND packet with an EXPLICIT sequence number — no
     // counter increment, no pending bookkeeping. Used for the initial send and

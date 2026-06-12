@@ -448,6 +448,33 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.3.0
+
+**Automatic fragmentation for long unicast commands** — `send()` now transparently
+handles commands longer than a single ESP-NOW packet (199 chars, or 187 with
+checksum enabled). Previously they were **silently truncated**: a long
+`?SEQ,SAVE,...` arrived cut short and a corrupt sequence got stored on the board
+(or, with checksum on, was rejected entirely after burning the retries).
+
+- **`send()` auto-fragments** oversized commands using the WCB firmware's MGMT
+  fragmentation protocol (the same one the web config tool uses): the command is
+  split into 179-char chunks, the target board reassembles them and executes the
+  whole command through its normal parser. Works up to ~2.8 KB — comfortably
+  covering the firmware's 1800-char stored-sequence limit.
+- **Reliability:** the MGMT layer has no per-chunk ACK, so the full chunk set is
+  transmitted in multiple passes (3 when `ensured`, 2 otherwise). Duplicates are
+  harmless — the board stores each chunk once and discards retransmits of
+  completed sessions. A fragmented send blocks ~10 ms per chunk per pass
+  (a maximal ensured send ≈ 0.5 s).
+- **`broadcast()` does NOT fragment** — fragmentation is unicast-only (the
+  reassembly session on the board is per-target). An oversized broadcast now
+  **fails loudly** (error log + `return false`) instead of silently truncating;
+  `send()` the long command to each board individually.
+- No API changes — existing sketches gain this automatically.
+
+> Requires WCB firmware with the MGMT fragmentation handler (present in all
+> 6.x firmware this library targets).
+
 ### 1.2.0
 
 Adds **ensured delivery**, and makes it the default for text commands so the
