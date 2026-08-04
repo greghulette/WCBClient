@@ -1537,6 +1537,19 @@ void WCB_Client::setIdentity(const char* type, const char* fw,
         Serial.printf("[WCB_Client] WDP identity set: type=\"%s\" fw=\"%s\"\n", _wdpType, _wdpFw);
 }
 
+void WCB_Client::setPortLabel(uint8_t port, const char* label) {
+    if (port < 1 || port > 5) return;
+    char* dst = _wdpPortLabels[port - 1];
+    char nv[25];
+    if (label) { strncpy(nv, label, sizeof(nv) - 1); nv[sizeof(nv) - 1] = '\0'; }
+    else       nv[0] = '\0';
+    if (strcmp(dst, nv) == 0) return;           // unchanged — don't churn the advert
+    strcpy(dst, nv);
+    // Changed → push the new label out promptly (short burst), like the WCB boards'
+    // on-change re-advert, so the Wizard/mesh reflect it in ~1 s instead of ~60 s.
+    if (_wdpType[0]) { _wdpBootLeft = 2; _wdpNextBootMs = millis() + 200; }
+}
+
 int WCB_Client::_buildWdpPayload(uint8_t* buf, int max) {
     int o = 0;
     if (max < 3) return 0;
@@ -1546,6 +1559,18 @@ int WCB_Client::_buildWdpPayload(uint8_t* buf, int max) {
     if (_wdpFw[0])    o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_FWVER,   (const uint8_t*)_wdpFw,    strlen(_wdpFw));
     if (_wdpHwRev[0]) o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_HWREV,   (const uint8_t*)_wdpHwRev, strlen(_wdpHwRev));
     if (_wdpCaps[0])  o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_CAPTAGS, (const uint8_t*)_wdpCaps,  strlen(_wdpCaps));
+    // Per-serial-port labels — one PORTLABEL TLV each, value = [port][label]. Emitted
+    // AFTER the identity TLVs so, if the advert runs tight on space, wcbPutTLV drops
+    // trailing labels rather than the identity (mirrors the WCB firmware's policy).
+    for (uint8_t p = 1; p <= 5; p++) {
+        const char* lbl = _wdpPortLabels[p - 1];
+        if (!lbl[0]) continue;
+        uint8_t pv[25];
+        pv[0] = p;
+        int L = (int)strlen(lbl); if (L > 24) L = 24;
+        memcpy(pv + 1, lbl, L);
+        o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_PORTLABEL, pv, 1 + L);
+    }
     if (_wdpTemporary) {   // tell WCBs to adopt this device as a TEMPORARY (not permanent) peer
         uint8_t flags = WCB_WDP_ADVFLAG_TEMPORARY;
         o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_FLAGS, &flags, 1);

@@ -709,6 +709,12 @@ public:
     // advert already carries it; a later change takes effect on the next periodic advert.
     void setTemporary(bool temporary) { _wdpTemporary = temporary; }
 
+    // Advertise a label for one of THIS device's serial ports (port 1-5) in the WDP
+    // advert, so WCBs + the Wizard show what's attached to it — the same PORTLABEL
+    // TLV the WCB boards emit. Empty/null clears that port. A change re-broadcasts
+    // promptly (short burst); no-op if the label is unchanged.
+    void setPortLabel(uint8_t port, const char* label);
+
 
 private:
 
@@ -769,6 +775,7 @@ private:
     char          _wdpFw[28]       = "";  // firmware version string
     char          _wdpHwRev[16]    = "";  // hardware revision ("" = omit)
     char          _wdpCaps[49]     = "";  // space-separated capability tags ("" = omit)
+    char          _wdpPortLabels[5][25] = {{0}};  // this device's OWN per-serial-port labels (WDP PORTLABEL TLVs); "" = omit that port
     bool          _wdpTemporary    = false;  // advertise the "temporary peer" flag (see setTemporary)
     uint8_t       _wdpBootLeft     = 0;   // remaining boot-burst adverts
     unsigned long _wdpNextBootMs   = 0;   // next boot-burst advert due
