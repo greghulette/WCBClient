@@ -102,6 +102,9 @@ constexpr uint8_t broadcast = 0;
 #define WCB_BULK_DONECACHE     4      // completed sessions remembered (to re-answer a lost FINAL)
 #define WCB_BULK_TIMEOUT_MS 15000UL   // abort a session idle this long (no BEGIN/CHUNK/DONE frame)
 #define WCB_BULK_MASK_BYTES ((WCB_BULK_MAX_CHUNKS + 7) / 8)   // 64 bytes
+#define WCB_WDP_MAX_MAESTRO    9      // Local Maestro IDs this device can advertise
+                              // (mirrors the firmware's WDP_MAX_MAESTRO — the receive side
+                              // truncates to the same 9, so advertising more is wasted bytes).
 #define WCB_WDP_NEIGHBOR_TTL_MS 180000UL  // Drop a learned WDP neighbor after this
                               // long without an advert (~6 missed 30s cycles).
 #define WCB_WDP_TEMP_ADVERT_MS       15000UL  // A TEMPORARY device adverts faster than the 60s
@@ -715,6 +718,22 @@ public:
     // promptly (short burst); no-op if the label is unchanged.
     void setPortLabel(uint8_t port, const char* label);
 
+    // Advertise the Maestro controllers THIS device hosts locally, so every WCB
+    // learns where they live and can build a remote-Maestro target for them —
+    // the same WDP MAESTRO / MAESTRO_CFG TLVs the WCB boards emit for their own.
+    // `ids` are the mesh-facing Maestro IDs (1-9, the number in ;M<id>), `bauds`
+    // the wire baud of each one's serial bus; both arrays are `count` long and
+    // are copied. count 0 (or ids == nullptr) clears the advert.
+    //
+    // A baud outside the WDP table advertises as "unknown": receivers still SEE
+    // the Maestro but won't auto-configure a proxy for it, since they'd have no
+    // safe rate to open it at. Supported: 110, 300, 600, 1200, 2400, 9600, 14400,
+    // 19200, 38400, 57600, 115200, 128000, 256000.
+    //
+    // Like setPortLabel(), an unchanged set is a no-op and a change re-broadcasts
+    // promptly. Call it again whenever the local Maestro set or its baud changes.
+    void setMaestroIds(const uint8_t* ids, uint8_t count, const uint32_t* bauds = nullptr);
+
 
 private:
 
@@ -776,6 +795,9 @@ private:
     char          _wdpHwRev[16]    = "";  // hardware revision ("" = omit)
     char          _wdpCaps[49]     = "";  // space-separated capability tags ("" = omit)
     char          _wdpPortLabels[5][25] = {{0}};  // this device's OWN per-serial-port labels (WDP PORTLABEL TLVs); "" = omit that port
+    uint8_t       _wdpMaestroIds[WCB_WDP_MAX_MAESTRO]  = {0};  // this device's OWN local Maestro IDs (setMaestroIds)
+    uint8_t       _wdpMaestroCodes[WCB_WDP_MAX_MAESTRO] = {0}; // baud wire-code per id (0xFF = unknown/unadvertisable)
+    uint8_t       _wdpMaestroCount = 0;   // 0 = omit the Maestro TLVs entirely
     bool          _wdpTemporary    = false;  // advertise the "temporary peer" flag (see setTemporary)
     uint8_t       _wdpBootLeft     = 0;   // remaining boot-burst adverts
     unsigned long _wdpNextBootMs   = 0;   // next boot-burst advert due

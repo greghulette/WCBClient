@@ -1506,6 +1506,21 @@ void WCB_Client::_sendHeartbeat() {
 #define WCB_WDP_TLV_MAESTRO   0x06  // bytes  — local Maestro IDs
 #define WCB_WDP_TLV_PORTLABEL 0x09  // [port][label] — one per labeled serial port
 #define WCB_WDP_TLV_CTRLID    0x0A  // uint8  — controller (special-peer) ID
+#define WCB_WDP_TLV_MAESTRO_CFG 0x0E // [id][baudCode] records — rich Maestro id+baud
+
+// Ordered, APPEND-ONLY Maestro baud table. The array INDEX is the wire code
+// carried in WCB_WDP_TLV_MAESTRO_CFG, so this must stay byte-identical to the
+// firmware's WDP_BAUD_TABLE (WCB_WDP.cpp) — reordering or removing an entry
+// silently drifts every advertised baud on the mesh.
+static const uint32_t WCB_WDP_BAUD_TABLE[] = {
+    0, 110, 300, 600, 1200, 2400, 9600, 14400,
+    19200, 38400, 57600, 115200, 128000, 256000
+};
+static uint8_t wcbWdpBaudToCode(uint32_t baud) {
+    for (uint8_t i = 0; i < sizeof(WCB_WDP_BAUD_TABLE) / sizeof(WCB_WDP_BAUD_TABLE[0]); i++)
+        if (WCB_WDP_BAUD_TABLE[i] == baud) return i;
+    return 0xFF;   // not in the table → advertise "unknown"; receivers won't auto-config it
+}
 
 // Append one TLV; returns the new offset (unchanged if it wouldn't fit).
 static int wcbPutTLV(uint8_t* buf, int o, int max, uint8_t type,
@@ -1550,6 +1565,29 @@ void WCB_Client::setPortLabel(uint8_t port, const char* label) {
     if (_wdpType[0]) { _wdpBootLeft = 2; _wdpNextBootMs = millis() + 200; }
 }
 
+void WCB_Client::setMaestroIds(const uint8_t* ids, uint8_t count, const uint32_t* bauds) {
+    if (!ids) count = 0;
+    if (count > WCB_WDP_MAX_MAESTRO) count = WCB_WDP_MAX_MAESTRO;
+
+    uint8_t nvIds[WCB_WDP_MAX_MAESTRO]   = {0};
+    uint8_t nvCodes[WCB_WDP_MAX_MAESTRO] = {0};
+    for (uint8_t i = 0; i < count; i++) {
+        nvIds[i]   = ids[i];
+        nvCodes[i] = bauds ? wcbWdpBaudToCode(bauds[i]) : 0xFF;
+    }
+
+    // Unchanged → don't churn the advert (same discipline as setPortLabel).
+    if (count == _wdpMaestroCount &&
+        memcmp(nvIds,   _wdpMaestroIds,   count) == 0 &&
+        memcmp(nvCodes, _wdpMaestroCodes, count) == 0) return;
+
+    memcpy(_wdpMaestroIds,   nvIds,   sizeof(nvIds));
+    memcpy(_wdpMaestroCodes, nvCodes, sizeof(nvCodes));
+    _wdpMaestroCount = count;
+
+    if (_wdpType[0]) { _wdpBootLeft = 2; _wdpNextBootMs = millis() + 200; }
+}
+
 int WCB_Client::_buildWdpPayload(uint8_t* buf, int max) {
     int o = 0;
     if (max < 3) return 0;
@@ -1559,6 +1597,18 @@ int WCB_Client::_buildWdpPayload(uint8_t* buf, int max) {
     if (_wdpFw[0])    o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_FWVER,   (const uint8_t*)_wdpFw,    strlen(_wdpFw));
     if (_wdpHwRev[0]) o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_HWREV,   (const uint8_t*)_wdpHwRev, strlen(_wdpHwRev));
     if (_wdpCaps[0])  o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_CAPTAGS, (const uint8_t*)_wdpCaps,  strlen(_wdpCaps));
+    // Local Maestros — the id-only TLV (what older receivers and the ?WDP display
+    // read) plus the rich [id][baudCode] TLV a receiver needs to auto-configure a
+    // remote proxy. Both, in this order, exactly as the WCB boards emit them.
+    if (_wdpMaestroCount > 0) {
+        o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_MAESTRO, _wdpMaestroIds, _wdpMaestroCount);
+        uint8_t rec[WCB_WDP_MAX_MAESTRO * 2];
+        for (uint8_t i = 0; i < _wdpMaestroCount; i++) {
+            rec[i * 2]     = _wdpMaestroIds[i];
+            rec[i * 2 + 1] = _wdpMaestroCodes[i];
+        }
+        o = wcbPutTLV(buf, o, max, WCB_WDP_TLV_MAESTRO_CFG, rec, _wdpMaestroCount * 2);
+    }
     // Per-serial-port labels — one PORTLABEL TLV each, value = [port][label]. Emitted
     // AFTER the identity TLVs so, if the advert runs tight on space, wcbPutTLV drops
     // trailing labels rather than the identity (mirrors the WCB firmware's policy).
