@@ -772,7 +772,13 @@ private:
     // A non-atomic ++ races and can hand the same sequence number to two
     // packets, causing the receiver's duplicate-detection to silently drop
     // one of them.  std::atomic<uint16_t> is lock-free on Xtensa.
-    std::atomic<uint16_t> _seqCounter;  // monotonic per-COMMAND sequence number
+    // Explicitly zero-initialised for hygiene: a default-initialised std::atomic
+    // holds an INDETERMINATE value, and a heap-allocated client (NaviCore does
+    // `new WCB_Client(...)`) does not get the static zeroing a global gets.
+    // begin() also assigns 0 before anything can send — send()/broadcast() bail
+    // on !_started — so this closes a window that is currently unreachable
+    // rather than a live bug. Left in so it stays unreachable.
+    std::atomic<uint16_t> _seqCounter{0};  // monotonic per-COMMAND sequence number
     unsigned long _nextHeartbeatMs;  // millis() when the next heartbeat is due
 
     // ETM timing — defaults match WCB firmware factory defaults.

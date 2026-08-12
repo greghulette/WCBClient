@@ -571,6 +571,24 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.12.1
+
+- **Sequence number 0 is no longer sent.** The WCB firmware's per-sender duplicate ring is
+  zero-initialised and treats `0` as "empty slot", so a COMMAND that landed on seq 0 — once
+  every 65,536 tracked sends — was **ACKd and then silently discarded as a duplicate** by
+  every board. The firmware ACKs before it de-dups, and the ensured retries reuse the same
+  sequence number, so the pending slot completed on those ACKs and the sender reported a
+  clean ensured delivery for a command that executed nowhere. `_sendPacket()` now skips 0 on
+  the wrap. Inbound, this library exempts seq 0 from its own de-dup, so the mirror case
+  would have double-fired the command instead.
+- **`_seqCounter` is explicitly zero-initialised.** A default-initialised `std::atomic` holds
+  an indeterminate value, and a heap-allocated client (`new WCB_Client(...)`, as NaviCore does)
+  gets none of the static zeroing a global-scope instance gets. `begin()` already assigns `0`
+  before anything can send, so this closes a window that was unreachable rather than a live
+  bug — it is there to keep it unreachable.
+
+> Changelog entries for 1.10.0–1.12.0 are not recorded here; see the commit history.
+
 ### 1.9.7
 
 - **Configurable ESP-NOW mesh channel.** The mesh channel (1–11) is now an explicit,

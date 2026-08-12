@@ -1792,7 +1792,18 @@ void WCB_Client::_sendAck(uint8_t targetID, uint16_t seqNum) {
 // The CRC suffix and wire framing live in _transmit() so retransmits reuse it.
 // ─────────────────────────────────────────────────────────────────────────────
 bool WCB_Client::_sendPacket(uint8_t targetID, const char* command, bool ensured) {
+    // Sequence 0 is RESERVED and must never go on the wire. The WCB firmware's
+    // per-sender duplicate ring is zero-initialised and reads 0 as "empty slot"
+    // ("Seq 0 is never sent, so 0 = empty slot", WCB.ino) — so a seq-0 COMMAND
+    // matches an empty entry, gets ACKd (the firmware ACKs BEFORE the dup check)
+    // and is then discarded as a duplicate. Every ensured retry reuses the same
+    // seq and dies identically, so the pending slot completes on those ACKs and
+    // the sender reports a clean ensured delivery for a command that executed on
+    // no board at all. Our own receive path exempts seq 0 from de-dup
+    // (_handleReceive), so the mirror case double-fires instead. Skipping 0 on
+    // the ~65k wrap costs one compare and keeps both sides honest.
     uint16_t seq = ++_seqCounter;   // atomic; never reused by a retransmit
+    if (seq == 0) seq = ++_seqCounter;
 
     // Decide whether to record this packet in the pending table:
     //   - unicast            → tracked (ACK info; freed on the target's ACK).
