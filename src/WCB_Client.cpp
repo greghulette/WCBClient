@@ -278,6 +278,13 @@ void WCB_Client::update() {
                 // UNICAST to each expected board that hasn't ACK'd (reusing the seq
                 // so it's deduped), up to ETM_MAX_RETRIES per board.
                 if (_ensuredComplete(p)) {            // every expected board acked / gone
+                    // STATS: this is the DOMINANT real-world failure path, not an
+                    // edge case. _checkOfflineBoards() ran at the top of update()
+                    // and the offline window is 50 s against a ~2 s retry budget,
+                    // so a target that has been powered off for any length of time
+                    // is already !online here — the slot completes with
+                    // retryCount == 0 and never reaches the give-up branch below.
+                    _settleSlot(p);
                     p.active = false;
                 } else if ((now - p.sentMs) >= ETM_RETRY_INTERVAL_MS) {
                     for (int b = 0; b < WCB_MAX_BOARDS; b++) {
@@ -286,23 +293,52 @@ void WCB_Client::update() {
                             // Dropped after being online (lastSeenMs!=0) -> give up.
                             // Never-online learned peer (lastSeenMs==0, advert-only
                             // client) -> keep retrying up to ETM_MAX_RETRIES.
-                            if (_boards[b].lastSeenMs != 0) { p.expected[b] = false; continue; }
+                            // STATS: credit the give-up HERE — clearing expected[b]
+                            // destroys the evidence, so the _settleSlot() sweeps
+                            // below would find nothing left to count for it.
+                            if (_boards[b].lastSeenMs != 0) { _statFail((uint8_t)b); p.expected[b] = false; continue; }
                         }
                         if (p.retryCount[b] < ETM_MAX_RETRIES) {
                             retryBoards[nRetry++] = (uint8_t)(b + 1);   // _transmit after unlock
                             p.retryCount[b]++;
+                            _stats[b].retries++;      // STATS: the only site with per-board
+                                                      // attribution — the _transmit() at the
+                                                      // bottom of the loop runs after the
+                                                      // unlock and has none left.
                         } else {
+                            _statFail((uint8_t)b);    // STATS: same reasoning as above
                             p.expected[b] = false;    // exhausted retries for this board
                         }
                     }
                     p.sentMs = now;                   // reset the retry window
-                    if (_ensuredComplete(p)) p.active = false;
+                    // KNOWN PESSIMISM, for a NEVER-ONLINE peer only (lastSeenMs
+                    // == 0 — an advert-only client that never heartbeats): the
+                    // branch above may have just queued this board's FINAL retry
+                    // and pushed retryCount[b] to ETM_MAX_RETRIES, which makes
+                    // _ensuredComplete() true right here. So the slot is settled
+                    // — crediting `failed` — in the same pass whose _transmit()
+                    // runs a few lines below, after the unlock. That attempt
+                    // gets no ACK window at all, and if the peer does answer,
+                    // the ACK finds no active slot.
+                    //
+                    // Left alone deliberately: the slot was ALREADY freed at
+                    // this point before counters existed, so the delivery
+                    // behaviour is unchanged and the counter is merely reporting
+                    // it. Holding the slot one more pass to give that attempt a
+                    // real window would be a delivery change, and belongs in its
+                    // own commit. For an ONLINE peer this cannot happen —
+                    // _ensuredComplete() keeps the slot outstanding while the
+                    // board is online, regardless of retryCount.
+                    if (_ensuredComplete(p)) { _settleSlot(p); p.active = false; }
                     if (nRetry) { memcpy(cmdCopy, p.command, sizeof(cmdCopy)); seqCopy = p.seqNum; }
                 }
             } else {
                 // Best-effort unicast: sent ONCE, no retransmit — free a slot whose
                 // ACK never arrived so the table can't leak (1 s >> ETM round-trip).
-                if ((now - p.sentMs) > 1000UL) p.active = false;
+                // STATS: an un-ACKd best-effort unicast is still a delivery we gave
+                // up on; _settleSlot credits it via the targetID rule in
+                // _statExpects (expected[] is empty for best-effort slots).
+                if ((now - p.sentMs) > 1000UL) { _settleSlot(p); p.active = false; }
             }
         }
         portEXIT_CRITICAL(&_pendingMux);
@@ -1846,6 +1882,48 @@ bool WCB_Client::_sendPacket(uint8_t targetID, const char* command, bool ensured
             }
         }
     }
+
+    // ── Delivery statistics (see WCBPeerStats) ───────────────────────────────
+    // Credit `sent` to every peer this delivery is actually aimed at. For an
+    // ensured broadcast that is every board in expected[] — an ensured broadcast
+    // IS a per-board guaranteed delivery (retried per board at :283-296, ACKd
+    // per board), so each board it waits on owns a share of it. Crediting only
+    // _statBroadcastSent would leave those boards' ackd/retries/failed with no
+    // matching `sent` and break the per-peer invariant.
+    //
+    // _statBroadcastSent counts broadcast FRAMES on the air, ensured or not, and
+    // is NOT a subset of any peer's `sent`. An ensured broadcast increments both.
+    //
+    // `degraded`: the saturation case handled just below — no slot was free, so
+    // this send goes out once, untracked, and can never be ACKd or failed.
+    // Counting it in `noSlot` is what keeps sent - (ackd + failed + noSlot)
+    // meaning "still in flight" instead of silently accruing a permanent residue.
+    //
+    // Gated on `track`, NOT on `ensured`: a best-effort UNICAST is tracked too
+    // (see `track` above), so it can also be denied a slot — and then it is
+    // transmitted once, untracked, and no ACK can ever match it. Gating on
+    // `ensured` would credit its `sent` and leave it forever unresolvable.
+    // A best-effort BROADCAST has track == false, never asks for a slot, and
+    // credits no per-peer `sent` at all, so it is unaffected either way.
+    const bool degraded = (slot < 0 && track);
+    if (targetID == WCB_TARGET_BROADCAST) {
+        _statBroadcastSent++;
+        if (ensured) {
+            for (int b = 0; b < WCB_MAX_BOARDS; b++) {
+                // Mirror expected[] exactly when we got a slot; re-evaluate the
+                // identical predicate when saturation denied us one. Same lock,
+                // same instant — the two cannot disagree.
+                bool aimed = (slot >= 0) ? _pending[slot].expected[b]
+                                         : (_boards[b].online && (b + 1) != _deviceID);
+                if (!aimed) continue;
+                _stats[b].sent++;
+                if (degraded) _stats[b].noSlot++;
+            }
+        }
+    } else if (targetID >= 1 && targetID <= WCB_MAX_BOARDS) {
+        _stats[targetID - 1].sent++;
+        if (degraded) _stats[targetID - 1].noSlot++;
+    }
     portEXIT_CRITICAL(&_pendingMux);
 
     if (slot < 0 && ensured) {
@@ -1924,6 +2002,95 @@ bool WCB_Client::_ensuredComplete(const WCBPending& p) const {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Delivery statistics
+//
+// Counters are accumulated at the pending table's existing hook points rather
+// than derived from _pending[] on read: a slot is freed the instant its delivery
+// resolves, so by the time anyone asked, the history would already be gone. The
+// table holds WCB_PENDING_MAX (10) in-flight COMMANDS — one slot per command,
+// NOT one per peer, so a single ensured broadcast to 20 boards occupies one slot
+// and tracks all 20 ACKs inside it.
+//
+// EVERY helper here assumes _pendingMux is HELD by the caller (see the header):
+// they run inside the critical sections that already serialise the pending table
+// between the loop task and the ESP-NOW receive task. None of them may take the
+// lock, print, or touch esp_now.
+// ─────────────────────────────────────────────────────────────────────────────
+bool WCB_Client::_statExpects(const WCBPending& p, uint8_t boardIdx) const {
+    if (p.ensured) return p.expected[boardIdx];
+    // A TRACKED best-effort send is always a unicast — best-effort broadcasts
+    // are never given a slot at all (see _sendPacket) — and it is waiting on
+    // exactly its own target.
+    return p.targetID != WCB_TARGET_BROADCAST &&
+           p.targetID >= 1 && (uint8_t)(p.targetID - 1) == boardIdx;
+}
+
+void WCB_Client::_statFail(uint8_t boardIdx) {
+    if (boardIdx < WCB_MAX_BOARDS) _stats[boardIdx].failed++;
+}
+
+void WCB_Client::_settleSlot(const WCBPending& p) {
+    if (!p.active) return;                     // already settled — never count twice
+    for (int b = 0; b < WCB_MAX_BOARDS; b++)
+        if (_statExpects(p, (uint8_t)b) && !p.ackReceived[b]) _statFail((uint8_t)b);
+}
+
+// ── Public accessors ─────────────────────────────────────────────────────────
+// Unlocked by design — see the header for why adding a lock here would be a
+// regression, and for the snapshot caveat.
+
+WCBPeerStats WCB_Client::getPeerStats(uint8_t wcbID) const {
+    if (wcbID < 1 || wcbID > WCB_MAX_BOARDS) return WCBPeerStats{};
+    return _stats[wcbID - 1];
+}
+
+WCBPeerStats WCB_Client::getAggregateStats() const {
+    WCBPeerStats total{};
+    for (int b = 0; b < WCB_MAX_BOARDS; b++) {
+        total.sent    += _stats[b].sent;
+        total.ackd    += _stats[b].ackd;
+        total.retries += _stats[b].retries;
+        total.failed  += _stats[b].failed;
+        total.noSlot  += _stats[b].noSlot;
+    }
+    return total;
+}
+
+uint32_t WCB_Client::getBroadcastSent() const { return _statBroadcastSent; }
+
+void WCB_Client::resetStats() {
+    // A WRITE, racing the RX task's ackd increment — so unlike the readers this
+    // one DOES take the lock. Pure array work inside, as always.
+    portENTER_CRITICAL(&_pendingMux);
+    memset(_stats, 0, sizeof(_stats));
+    _statBroadcastSent = 0;
+
+    // Re-credit `sent` for every delivery STILL IN FLIGHT. A bare zeroing would
+    // leave the active slots armed to deliver `ackd`/`failed` against a `sent`
+    // of 0, permanently inverting ackd + failed + noSlot <= sent — and these
+    // counters never wrap back, so that inversion would outlive by far the
+    // traffic that caused it. Re-crediting exactly the outstanding expectations
+    // makes a reset mean "start counting from here" rather than "corrupt the
+    // books for whatever happened to be in the air".
+    //
+    // Slots are deliberately NOT settled or freed here: a reset is a diagnostic
+    // action and must never drop a guaranteed command. This is the one place a
+    // stats call reads the pending table for something other than counting,
+    // which is why it runs under the same lock as everything else.
+    //
+    // Bounded at WCB_PENDING_MAX x WCB_MAX_BOARDS (10 x 20) iterations of pure
+    // array work. That is longer than the other critical sections here, but a
+    // reset is a rare operator action, not a per-packet path.
+    for (int i = 0; i < WCB_PENDING_MAX; i++) {
+        const WCBPending& p = _pending[i];
+        if (!p.active) continue;
+        for (int b = 0; b < WCB_MAX_BOARDS; b++)
+            if (_statExpects(p, (uint8_t)b) && !p.ackReceived[b]) _stats[b].sent++;
+    }
+    portEXIT_CRITICAL(&_pendingMux);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // _checkOfflineBoards
 //
 // Scans the board status table on every update() call. If a WCB's last
@@ -1995,7 +2162,12 @@ int WCB_Client::_findFreePending() {
         unsigned long age = now - _pending[i].sentMs;
         if (victim < 0 || age > maxAge) { maxAge = age; victim = i; }
     }
-    if (victim >= 0) _pending[victim].active = false;
+    // STATS: an evicted slot is a delivery we stop waiting on — including a
+    // best-effort unicast that is reclaimable at ANY age (see `reclaimable`
+    // above), so one milliseconds old can be dropped well inside the 1 s window
+    // the update() timeout treats as legitimate, and its later ACK will find no
+    // active slot. Counting it here is the only way that becomes visible.
+    if (victim >= 0) { _settleSlot(_pending[victim]); _pending[victim].active = false; }
     return victim;   // -1 => every slot is an outstanding ensured delivery
 }
 
@@ -2091,11 +2263,31 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
                 if (!_pending[i].active) continue;
                 if (_pending[i].seqNum != pkt->structSequenceNumber) continue;
 
-                if (senderID >= 1 && senderID <= WCB_MAX_BOARDS)
+                if (senderID >= 1 && senderID <= WCB_MAX_BOARDS) {
+                    // STATS: count the TRANSITION, not the packet. A peer re-ACKs
+                    // every retransmit it hears — _sendAck() is the first thing
+                    // the COMMAND case does, ahead of the CRC reject and the
+                    // de-dup check — and an ensured BROADCAST slot deliberately
+                    // stays open below to collect multi-board ACKs. So one board
+                    // can ACK the same slot up to 1 + ETM_MAX_RETRIES = 4 times;
+                    // incrementing next to the assignment would over-count 4x.
+                    // The _statExpects gate additionally stops a late ACK from
+                    // counting on top of a `failed` we already credited (giving
+                    // up clears expected[], so the predicate goes false).
+                    if (!_pending[i].ackReceived[senderID - 1] &&
+                        _statExpects(_pending[i], (uint8_t)(senderID - 1)))
+                        _stats[senderID - 1].ackd++;
                     _pending[i].ackReceived[senderID - 1] = true;
+                }
 
-                if (_pending[i].targetID != WCB_TARGET_BROADCAST)
+                if (_pending[i].targetID != WCB_TARGET_BROADCAST) {
+                    // STATS: the unicast slot closes here regardless of WHICH
+                    // board ACKd (this free is not gated on senderID ==
+                    // targetID), so settle it — if its own target never ACKd,
+                    // that is a delivery we just stopped waiting on.
+                    _settleSlot(_pending[i]);
                     _pending[i].active = false;
+                }
 
                 break;
             }

@@ -241,6 +241,59 @@ struct WCBPending {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Delivery statistics — per-peer ETM COMMAND accounting
+//
+// WHAT IS COUNTED: the COMMAND layer only — everything that goes through
+// send() / broadcast() / sendToSpecialPeer() and therefore carries a sequence
+// number that can be ACKd. That is the only outbound traffic with a delivery
+// signal to count.
+//
+// WHAT IS NOT COUNTED, DELIBERATELY: sendRaw() and sendKyber() — and so every
+// WCBStream / Maestro byte, usually the highest-volume class on the mesh —
+// plus sendRawPacket() (OTA), the MGMT chunks an oversized send() fragments
+// into, heartbeats, WDP adverts and outbound ACKs. None of them is ACKd, so
+// crediting `sent` for them would leave `ackd` permanently zero against a
+// climbing `sent`, which reads as a dead link rather than as "not measured".
+// An airtime metric, if it is ever wanted, needs its own counter — not this one.
+//
+// WHY sent AND retries ARE SEPARATE: `sent` counts COMMANDS, `retries` counts
+// EXTRA attempts; total airtime for a peer is sent + retries. Folding retries
+// into `sent` would let a link that retries constantly show a healthy-looking
+// ackd/sent ratio while flooding the mesh.
+//
+// INVARIANT, per peer AND in the aggregate:  ackd + failed + noSlot <= sent
+// The difference is commands still in flight. Observing the left side exceed
+// `sent` means a pending slot was settled twice — a bug in this library, not a
+// lost packet. What holds it together is that ONE predicate (_statExpects)
+// decides both who gets `sent` at send time and who may get `ackd`/`failed`
+// later; resetStats() re-credits `sent` for whatever is in flight for the same
+// reason. The one known exception is documented at resetStats()'s sibling gap:
+// a re-begin() wipes _pending[] without settling it, which loses outstanding
+// expectations (leaving a permanent "in flight" residue, not an inversion).
+struct WCBPeerStats {
+    uint32_t sent;     // COMMANDs aimed at this peer — INITIAL attempts only.
+                       // An ensured broadcast credits every board it expects to
+                       // ACK: it is a per-board guaranteed delivery, retried and
+                       // acknowledged per board, so it belongs to each of them.
+    uint32_t ackd;     // this peer's ACKs, counted once per command (a peer
+                       // re-ACKs every retransmit it hears — see _handleReceive)
+    uint32_t retries;  // resend attempts to this peer; N retries on one command
+                       // counts N
+    uint32_t failed;   // we stopped waiting for this peer's ACK without getting
+                       // one — retries exhausted, peer dropped offline, slot
+                       // evicted, or a best-effort unicast that timed out
+    uint32_t noSlot;   // a send that asked for a pending slot and was denied one
+                       // because the table was saturated: transmitted once,
+                       // never tracked, so no ACK can ever match it and it can
+                       // never become ackd or failed. Covers BOTH an ensured
+                       // send losing its guarantee and a best-effort unicast
+                       // losing its ACK tracking. Separate from `failed` on
+                       // purpose — this is local backpressure, not a link
+                       // problem, and conflating them sends someone to check
+                       // antennas over a software condition.
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WDP discovery — a neighbor learned from a WDP advert
 //
 // Populated by the WDP consumer when another WCB (or a WCB_Client device that
@@ -506,6 +559,56 @@ public:
     // the target is reachable before dispatching a critical command.
     bool isOnline(uint8_t wcb_number);
 
+    // ── Delivery statistics ──────────────────────────────────────────────────
+    // Read-only counters for the ETM COMMAND layer. See WCBPeerStats above for
+    // exactly what is and is not counted, and for the per-peer invariant.
+    //
+    // These are diagnostics, not control flow: use them to see which links are
+    // healthy, not to decide whether to send. Cheap enough to poll from loop().
+
+    // Counters for one peer, 1..WCB_MAX_BOARDS. An out-of-range id returns a
+    // zeroed struct rather than failing, so a telemetry loop can call it blind.
+    //
+    // Returned BY VALUE: 20 bytes is five words, trivial next to a radio send,
+    // and a reference would hand the caller a live view of state the ESP-NOW
+    // receive task mutates underneath it.
+    //
+    // NOT LOCKED, deliberately. Each counter is an aligned 32-bit word, so a
+    // single load cannot tear on this MCU — do NOT "fix" this by adding a lock,
+    // it would put the loop task in contention with the RX callback for the
+    // pending-table spinlock. The honest caveat is one level up: the five
+    // fields are read one at a time, so the struct is a near-instant sample and
+    // not a mutually consistent snapshot (a peer's ackd may include an ACK that
+    // landed just after its sent was read). Harmless for telemetry.
+    WCBPeerStats getPeerStats(uint8_t wcbID) const;
+
+    // Totals across all peers. Computed on demand — a second running total
+    // would be a second thing to get wrong, and summing 20 peers costs nothing
+    // next to a radio send. Same snapshot caveat as getPeerStats().
+    //
+    // The invariant holds in the aggregate exactly as it does per peer, because
+    // `ackd` is gated on the same _statExpects predicate that granted `sent`.
+    // The deliberate consequence: a board that was OFFLINE when an ensured
+    // broadcast went out still hears it and ACKs, and that ACK is discarded
+    // rather than counted. It is real evidence the board is reachable, but it
+    // has no matching `sent` and counting it would make ackd exceed sent for a
+    // peer we never aimed at. Reachability is what getNeighbor()/isOnline() are
+    // for; these counters answer "did what I sent arrive", not "who is out there".
+    WCBPeerStats getAggregateStats() const;
+
+    // Broadcast COMMAND frames put on the air — a FRAME counter, not a delivery
+    // counter, and NOT a subset of any peer's `sent`. One ensured broadcast is
+    // one frame here AND one `sent` against each board expected to ACK it; a
+    // best-effort broadcast is one frame here and nothing per-peer, because
+    // nothing about its delivery is observable.
+    uint32_t getBroadcastSent() const;
+
+    // Zero every counter. Without this a board that had one bad hour looks bad
+    // forever and the ratios stop meaning anything. Takes the pending-table
+    // lock (it races the RX task's ackd increment), so call it from loop(),
+    // not from inside a receive callback.
+    void resetStats();
+
     // ── Special peer (NaviCore) ────────────────────────────────────────────────
 
     // Enable two-way communication with the out-of-band "special peer" — e.g.
@@ -765,6 +868,18 @@ private:
     // apply in _handleReceive). Only _seqCounter needs to stay separately atomic.
     portMUX_TYPE   _pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
+    // ── Delivery statistics ──────────────────────────────────────────────────
+    // Accumulated at the pending table's existing hook points (see WCBPeerStats).
+    // Written ONLY with _pendingMux held — `ackd` is incremented on the RX task
+    // while `sent`/`retries` are incremented on the loop task, and the lock that
+    // already serialises those two contexts covers the counters for free. Read
+    // unlocked by the accessors. Costs a MEASURED 400 B (examples/AllFeatures,
+    // esp32s3: 54944 -> 55344 B of globals) — 20 peers x 20 B, with the scalar
+    // absorbed into existing padding. Lands in .bss on a global-scope client,
+    // on the internal-SRAM heap for NaviCore, which allocates the client.
+    WCBPeerStats   _stats[WCB_MAX_BOARDS] = {};
+    uint32_t       _statBroadcastSent     = 0;
+
     // ── ETM state ────────────────────────────────────────────────────────────
     // Atomic: the sequence number is incremented from BOTH cores — the main
     // loop (send()/broadcast() via the application) AND the ESP-NOW receive
@@ -997,6 +1112,36 @@ private:
     // True when an ensured packet is fully delivered: every board in p.expected[]
     // has either ACK'd or dropped offline (so we no longer wait on it).
     bool _ensuredComplete(const WCBPending& p) const;
+
+    // ── Delivery-statistics helpers ──────────────────────────────────────────
+    // ALL THREE REQUIRE _pendingMux TO BE HELD BY THE CALLER and must never take
+    // it themselves — they are called from inside the existing critical sections
+    // in _sendPacket(), update() and the ACK handler, and a recursive acquire of
+    // the same spinlock on the same core is an instant deadlock. Same contract
+    // _findFreePending() already carries.
+    //
+    // Keep them free of Serial and esp_now calls for the same reason the
+    // surrounding sections are: portENTER_CRITICAL disables interrupts on that
+    // core, and a blocking UART write there hangs or crashes the chip. If you
+    // are tempted to printf a counter while debugging, do it AFTER the unlock.
+
+    // Is slot `p` still counting on board `boardIdx` (0-based) to ACK? This is
+    // the SAME predicate that decided who got credited `sent`, which is what
+    // keeps ackd + failed + noSlot <= sent true. An ensured slot carries an
+    // explicit expected[] set; a tracked best-effort unicast implicitly expects
+    // only its own target. A board given up on has expected[] cleared, so it
+    // answers false — that is what stops a late ACK counting after `failed`.
+    bool _statExpects(const WCBPending& p, uint8_t boardIdx) const;
+
+    // Credit `failed` to one board — we stopped waiting without an ACK.
+    void _statFail(uint8_t boardIdx);
+
+    // Credit `failed` to every board this slot is still waiting on. Called at
+    // EVERY site that deactivates a slot, so a give-up cannot slip through an
+    // un-instrumented path. Sites that give up on ONE board (and clear its
+    // expected[] bit) credit it directly instead; this sweep then sees nothing
+    // for that board, which is exactly why there is no double count.
+    void _settleSlot(const WCBPending& p);
 
     // Scan _boards[] and mark any WCB as offline if its last heartbeat is older
     // than (heartbeatInterval * missedBeforeOffline) seconds.
