@@ -264,8 +264,8 @@ sensibly decide.
 
 ```cpp
 WCBPeerStats s = wcb.getPeerStats(2);
-Serial.printf("WCB2: %lu sent, %lu ackd, %lu retries, %lu failed, %lu noSlot\n",
-              s.sent, s.ackd, s.retries, s.failed, s.noSlot);
+Serial.printf("WCB2: %lu sent, %lu ackd, %lu retries, %lu failed, %lu unguaranteed\n",
+              s.sent, s.ackd, s.retries, s.failed, s.unguaranteed);
 ```
 
 | Counter | Increments when |
@@ -274,13 +274,13 @@ Serial.printf("WCB2: %lu sent, %lu ackd, %lu retries, %lu failed, %lu noSlot\n",
 | `ackd` | that peer's ACK arrives for a command we were waiting on — **once per command**, even though a peer re-ACKs every retransmit it hears |
 | `retries` | a resend fires to that peer; N retries on one command counts N |
 | `failed` | we stopped waiting for that peer's ACK without getting one — retries exhausted, peer dropped offline, slot evicted, or a best-effort unicast that timed out |
-| `noSlot` | a send **asked for a pending slot and was denied one** because all `WCB_PENDING_MAX` were busy: transmitted once, never tracked, so no ACK can match it and it can never be ackd or failed. Covers an ensured send losing its guarantee *and* a best-effort unicast losing its ACK tracking. Local backpressure, not a link problem |
+| `unguaranteed` | a send **asked for a pending slot and was denied one** because all `WCB_PENDING_MAX` were busy: transmitted once, never tracked, so no ACK can match it and it can never be ackd or failed. Covers an ensured send losing its guarantee *and* a best-effort unicast losing its ACK tracking. Local backpressure, not a link problem |
 
 `sent` counts **commands**; `retries` counts **extra attempts**. Total airtime for a peer is
 `sent + retries`. They are kept apart on purpose — folding retries into `sent` would let a
 link that retries constantly show a healthy-looking `ackd/sent` while flooding the mesh.
 
-**Invariant, per peer and in the aggregate:** `ackd + failed + noSlot <= sent`, the difference
+**Invariant, per peer and in the aggregate:** `ackd + failed + unguaranteed <= sent`, the difference
 being commands still in flight. `resetStats()` re-credits `sent` for whatever is in flight at
 the moment of the reset, so a reset means "start counting here" rather than leaving in-air
 commands to land as `ackd` against a zeroed `sent`.
@@ -648,7 +648,7 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 - **Per-peer delivery statistics.** `getPeerStats()`, `getAggregateStats()`,
   `getBroadcastSent()` and `resetStats()` expose `sent` / `ackd` / `retries` / `failed` /
-  `noSlot` counts for the ETM COMMAND layer, so a host can finally see which mesh links are
+  `unguaranteed` counts for the ETM COMMAND layer, so a host can finally see which mesh links are
   healthy and which are retrying or failing. Read-only, free-running `uint32_t`, ~400 bytes.
   See **API Reference → Delivery statistics** for exactly what is and is not counted — raw
   and Maestro traffic is deliberately excluded, because it carries no delivery signal.
