@@ -57,10 +57,23 @@ change has only been compiled.
 Key entry points: `setIdentity()` (WDP advert — name + firmware), `setPortLabel()` (per-serial
 -port labels the Wizard displays), `setMaestroIds()` (which Maestros this device hosts),
 `enableSpecialPeer()` (out-of-band peer such as NaviCore), `onNeighbor()`/`getNeighbor()`
-(consume adverts), `onRawPacket()`/`sendRawPacket()` (custom protocols, e.g. OTA).
+(consume adverts), `onRawPacket()`/`sendRawPacket()` (custom protocols, e.g. OTA),
+`requestSequenceNames()`/`onSequenceNames()` (pull a WCB's stored-sequence inventory).
 
 Auto-join is **on by default**: the device registers WCBs it hears as peers and remembers
 them across reboots, so `wcb_quantity` does not need to cover the fleet.
+
+**Two callback families deliberately break rule 2** — the bulk-transfer hooks and
+`onSequenceNames()` fire from `update()` on the **loop** task, precisely so consumers can do
+flash I/O and allocation inside them. Both say so in the header; state the calling context
+explicitly on anything new, either way.
+
+**The sequence inventory is names, never values.** `requestSequenceNames()` exists because
+the WCB config pull carries sequence *values* and silently returns **nothing** once the whole
+config exceeds ~2912 chars. Don't "improve" it into fetching contents — that walks straight
+back into the bug it routes around. The companion `WCBNeighbor::seqHash` (WDP TLV `0x13`) is
+what makes it cheap: pull only when the fingerprint moves. Design doc lives in the WCB repo,
+`docs/SEQUENCE_INVENTORY.md`.
 
 ## Conventions
 

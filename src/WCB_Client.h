@@ -200,6 +200,44 @@ typedef struct __attribute__((packed)) {
 } wcb_packet_mgmt_t;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stored-sequence inventory request (see requestSequenceNames / onSequenceNames)
+//
+// Two packets, both byte-identical to the WCB firmware's espnow_struct_config_req
+// (43 B) and espnow_struct_config_frag (230 B). The firmware routes inbound ESP-NOW
+// BY SIZE and only then by packetType — CONFIG_REQ(5) and MGMT_FRAG_UNICAST(5) share
+// a type number and are told apart solely by 43 vs 226 bytes. So these sizes are
+// load-bearing: a stray field here silently routes the packet into another handler
+// (or nowhere). The static_asserts in WCB_Client.cpp pin them.
+//
+// Why names and not the whole config: the firmware's config pull carries sequence
+// VALUES and caps at 16 chunks (~2912 chars) for the ENTIRE board config, which a
+// real sequence set exhausts — and the target then sends NOTHING, with the "too
+// large" diagnostic behind a debug flag. An inventory is ~16 bytes per entry.
+// ─────────────────────────────────────────────────────────────────────────────
+#define WCB_PACKET_SEQ_REQ    13   // firmware PACKET_TYPE_SEQ_REQ  (this → target)
+#define WCB_PACKET_SEQ_FRAG   14   // firmware PACKET_TYPE_SEQ_FRAG (target → this)
+#define WCB_SEQ_PAYLOAD_SIZE  183  // firmware CONFIG_PAYLOAD_SIZE
+#define WCB_SEQ_MAX_CHUNKS    16   // firmware MGMT_MAX_CHUNKS (uint16 mask)
+
+typedef struct __attribute__((packed)) {
+    char    structPassword[40];
+    uint8_t packetType;            // WCB_PACKET_SEQ_REQ
+    uint8_t targetWCB;             // board to ask
+    uint8_t requesterWCB;          // this device's ID — the target answers only this
+} wcb_packet_seq_req_t;
+
+typedef struct __attribute__((packed)) {
+    char     structPassword[40];
+    uint8_t  packetType;           // WCB_PACKET_SEQ_FRAG
+    uint8_t  sourceWCB;            // board that answered
+    uint8_t  requesterWCB;         // who this is for
+    uint16_t sessionId;
+    uint8_t  chunkIdx;
+    uint8_t  totalChunks;
+    char     payload[WCB_SEQ_PAYLOAD_SIZE];
+} wcb_packet_seq_frag_t;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Internal state types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -339,6 +377,13 @@ struct WCBNeighbor {
     uint8_t       maestroIds[9];     // this board's local Maestro IDs
     uint8_t       maestroCount;
     char          portLabels[5][25]; // advertised serial-port labels ("" = unlabeled)
+    // Fingerprint of this board's STORED SEQUENCE inventory (WDP TLV 0x13).
+    // Changes whenever a sequence is saved, renamed or erased on that board, so a
+    // consumer can cache the name list from requestSequenceNames() and re-pull only
+    // when this moves — instead of polling. 0 = not advertised (firmware older than
+    // the TLV); it does NOT mean "no sequences", because an EMPTY inventory hashes
+    // to the FNV-1a basis 0x811C9DC5.
+    uint32_t      seqHash;
     unsigned long lastSeenMs;        // millis() of the last advert heard
 };
 
@@ -374,6 +419,21 @@ typedef void (*WCBRawPacketCallback)(const uint8_t* mac, const uint8_t* data, in
 // (WiFi) task — keep it minimal; poll getNeighbor() from loop() for heavier
 // work. `nb` is valid only for the duration of the call.
 typedef void (*WCBNeighborCallback)(const WCBNeighbor& nb);
+
+// Called when a board answers requestSequenceNames() with its stored-sequence
+// inventory. FIRES ON THE LOOP TASK (from update()), so it is safe to do real work
+// (allocate, touch flash, rebuild a UI model) inside it.
+//   wcbNumber : the board that answered
+//   hash      : inventory fingerprint — the same value that board advertises as
+//               WCBNeighbor::seqHash. Cache it; re-request only when it changes.
+//   count     : number of sequence names
+//   names     : comma-separated key list, NUL-terminated ("" when count == 0).
+//               Keys can never contain a comma (the firmware takes a stored key as
+//               everything before the first comma), so a plain split is safe.
+// `names` points at library-owned memory that is freed when the callback returns —
+// copy anything you need to keep.
+typedef void (*WCBSequenceNamesCallback)(uint8_t wcbNumber, uint32_t hash,
+                                         uint16_t count, const char* names);
 
 // ── Bulk-transfer callbacks (see onBulkBegin/onBulkChunk/onBulkComplete) ──────
 // ALL THREE FIRE ON THE LOOP TASK (from update()), never the RX/WiFi task, so the
@@ -685,6 +745,33 @@ public:
 
     // Number of neighbors currently in the table.
     uint8_t neighborCount();
+
+    // ── Stored-sequence inventory ──────────────────────────────────────────────
+
+    // Register the callback fired when a board answers requestSequenceNames().
+    // Registering it also ARMS interception of the response packets: until a
+    // callback is set, SEQ_FRAG packets fall through to onRawPacket() exactly as
+    // before, so a sketch that doesn't use this is completely unaffected.
+    void onSequenceNames(WCBSequenceNamesCallback callback);
+
+    // Ask WCB `wcbNumber` for the NAMES of its stored sequences (?SEQ keys) — not
+    // their contents. The reply arrives asynchronously on the callback above,
+    // typically within ~100 ms on a quiet mesh.
+    //
+    // The request is broadcast three times (a first frame to a board is routinely
+    // dropped on a busy mesh); the target dedups within 1.5 s, so this still yields
+    // exactly ONE response. Only one request may be in flight at a time — a second
+    // call while one is pending returns false rather than corrupting reassembly.
+    // A request that gets no complete answer within ~4 s is abandoned silently;
+    // just call again.
+    //
+    // Returns false if: not started, `wcbNumber` out of range, a request is already
+    // pending, no callback registered, or the reassembly buffer couldn't be
+    // allocated (~3 KB, held only while the request is in flight).
+    bool requestSequenceNames(uint8_t wcbNumber);
+
+    // True while a requestSequenceNames() is awaiting its reply.
+    bool sequenceNamesPending() const { return _seqPending; }
 
     // Auto-join (default ON): when this device decodes a WDP advert from a node
     // it isn't already peered with — a WCB OR a client device (mesh monitor, other
@@ -1174,6 +1261,38 @@ private:
     // Called each update(); fires onNeighbor(valid=false) on expiry. Also drops
     // (deregisters) an auto-joined peer that has aged out.
     void _ageNeighbors(unsigned long now);
+
+    // ── Stored-sequence inventory request state ───────────────────────────────
+    // The reassembly buffer is ~3 KB, so it is heap-allocated only while a request
+    // is in flight and freed the moment the result is delivered or abandoned — a
+    // library this widely included shouldn't cost every sketch 3 KB of BSS for a
+    // feature most don't use.
+    WCBSequenceNamesCallback _seqNamesCallback = nullptr;
+    bool          _seqPending     = false;   // a request is awaiting its reply
+    uint8_t       _seqTargetWCB   = 0;       // board we asked
+    uint16_t      _seqSessionId   = 0;       // session of the frags being reassembled (0 = none yet)
+    uint8_t       _seqTotalChunks = 0;
+    uint16_t      _seqReceivedMask = 0;      // bit i = chunk i in hand
+    char*         _seqChunks      = nullptr; // [WCB_SEQ_MAX_CHUNKS][WCB_SEQ_PAYLOAD_SIZE+1], heap
+    unsigned long _seqDeadlineMs  = 0;       // abandon the request at this time
+    volatile bool _seqComplete    = false;   // set on the RX task, consumed by update()
+    // The RX task writes into _seqChunks while the LOOP task frees it on delivery
+    // or timeout — a use-after-free window without this. Same pattern as _bulkMux:
+    // the guarded regions are tiny (a bounds check + one 183-byte memcpy on RX, a
+    // pointer swap on loop), never the String building or the user callback.
+    portMUX_TYPE  _seqMux = portMUX_INITIALIZER_UNLOCKED;
+
+    // Try to consume a non-252-byte packet as a SEQ_FRAG. Returns true if it was
+    // one (and thus must NOT also go to the raw-packet hook). Runs on the WiFi
+    // task: it only memcpys into the buffer and sets _seqComplete — the callback
+    // itself fires from _seqTick() on the loop task.
+    bool _maybeHandleSeqFrag(const uint8_t* data, int len);
+
+    // Deliver a completed inventory / abandon a timed-out request. Loop task.
+    void _seqTick(unsigned long now);
+
+    // Free the reassembly buffer and clear the in-flight state.
+    void _seqReset();
 
     // Register a regular WCB learned via WDP as an ESP-NOW peer, live, and
     // persist it. Derived MAC, idempotent, guarded against self / the special

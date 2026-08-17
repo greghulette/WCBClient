@@ -222,6 +222,7 @@ void WCB_Client::update() {
     _bulkTick(now);      // bulk session timeout + completed-session cache expiry
     _wdpTick();          // WDP device-identity advert cadence (boot burst + periodic)
     _ageNeighbors(now);  // expire WDP neighbors we haven't heard from recently
+    _seqTick(now);       // deliver/abandon a pending sequence-name request (callback fires HERE)
 
     // Drain deferred auto-joins on the LOOP task. _handleWdpAdvert (which flags
     // these) runs in the ESP-NOW receive callback (WiFi task), where
@@ -1172,6 +1173,179 @@ uint8_t WCB_Client::neighborCount() {
     return n;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stored-sequence inventory  (requestSequenceNames / onSequenceNames)
+//
+// A pull, not a push: the names are NOT in the WDP advert, because ~16 bytes per
+// name would evict the port labels from the advert's fixed 200-byte payload. What
+// WDP carries instead is a 4-byte fingerprint (WCBNeighbor::seqHash) that tells a
+// consumer WHEN to call this.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The firmware routes ESP-NOW by packet SIZE before it ever looks at packetType
+// (CONFIG_REQ and MGMT_FRAG_UNICAST are both type 5, told apart only by 43 vs 226
+// bytes). If a compiler ever pads these, the packets would route into the wrong
+// handler — or be dropped with no diagnostic at either end. Fail the build instead.
+static_assert(sizeof(wcb_packet_seq_req_t)  == 43,
+              "wcb_packet_seq_req_t must match the firmware's espnow_struct_config_req (43 B)");
+static_assert(sizeof(wcb_packet_seq_frag_t) == 230,
+              "wcb_packet_seq_frag_t must match the firmware's espnow_struct_config_frag (230 B)");
+
+#define WCB_SEQ_TIMEOUT_MS 4000   // generous: 3x REQ + up to 16 frags at 20 ms apart
+
+void WCB_Client::onSequenceNames(WCBSequenceNamesCallback callback) {
+    _seqNamesCallback = callback;
+}
+
+// Detach the reassembly buffer from the RX task, then free it. The detach must be
+// inside the lock so _maybeHandleSeqFrag can't be mid-memcpy when the free lands;
+// the free itself is deliberately OUTSIDE it (heap work in a critical section
+// blocks the other core).
+void WCB_Client::_seqReset() {
+    portENTER_CRITICAL(&_seqMux);
+    char* doomed = _seqChunks;
+    _seqChunks   = nullptr;
+    _seqPending  = false;
+    portEXIT_CRITICAL(&_seqMux);
+    if (doomed) free(doomed);
+    _seqTargetWCB    = 0;
+    _seqSessionId    = 0;
+    _seqTotalChunks  = 0;
+    _seqReceivedMask = 0;
+    _seqComplete     = false;
+}
+
+bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
+    if (!_started)                                    return false;
+    if (wcbNumber < 1 || wcbNumber > WCB_MAX_BOARDS)  return false;
+    if (_seqPending)                                  return false;   // one at a time
+    if (!_seqNamesCallback)                           return false;   // nowhere to deliver
+
+    const size_t bufSize = (size_t)WCB_SEQ_MAX_CHUNKS * (WCB_SEQ_PAYLOAD_SIZE + 1);
+    _seqChunks = (char*)calloc(1, bufSize);
+    if (!_seqChunks) return false;
+
+    _seqPending      = true;
+    _seqTargetWCB    = wcbNumber;
+    _seqSessionId    = 0;      // adopt whatever session the first frag carries
+    _seqTotalChunks  = 0;
+    _seqReceivedMask = 0;
+    _seqComplete     = false;
+    _seqDeadlineMs   = millis() + WCB_SEQ_TIMEOUT_MS;
+
+    wcb_packet_seq_req_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
+    pkt.packetType   = WCB_PACKET_SEQ_REQ;
+    pkt.targetWCB    = wcbNumber;
+    pkt.requesterWCB = (uint8_t)_deviceID;
+
+    // Broadcast 3x — a first frame to a given board is routinely dropped on a busy
+    // mesh, and the target dedups repeats inside 1.5 s, so this is still one reply.
+    // Broadcast (not unicast) so this works without the target being a peer yet.
+    for (int i = 0; i < 3; i++) {
+        esp_now_send(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
+        delay(15);
+    }
+    return true;
+}
+
+// WiFi/RX task. Keep this to memcpy + flag work only — the user callback fires
+// from _seqTick() on the loop task, where doing real work is safe.
+bool WCB_Client::_maybeHandleSeqFrag(const uint8_t* data, int len) {
+    if (!_seqPending || !_seqChunks)                     return false;
+    if (len != (int)sizeof(wcb_packet_seq_frag_t))       return false;
+
+    wcb_packet_seq_frag_t pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    pkt.structPassword[sizeof(pkt.structPassword) - 1] = '\0';
+
+    if (pkt.packetType != WCB_PACKET_SEQ_FRAG)                     return false;
+    if (strncmp(pkt.structPassword, _password,
+                sizeof(pkt.structPassword) - 1) != 0)              return false;
+    if (pkt.requesterWCB != (uint8_t)_deviceID)                    return false;
+    if (pkt.sourceWCB   != _seqTargetWCB)                          return false;
+    // Bound-check BEFORE indexing: totalChunks==0 would make expectedMask 0xFFFF
+    // and the session never complete; an out-of-range chunkIdx would write past
+    // the buffer.
+    if (pkt.totalChunks == 0 || pkt.totalChunks > WCB_SEQ_MAX_CHUNKS) return true;
+    if (pkt.chunkIdx >= pkt.totalChunks)                             return true;
+
+    if (_seqSessionId == 0) {          // first frag of the answer — adopt its session
+        _seqSessionId   = pkt.sessionId;
+        _seqTotalChunks = pkt.totalChunks;
+    } else if (pkt.sessionId != _seqSessionId) {
+        return true;                   // a different session; consumed but ignored
+    }
+
+    // Guarded: _seqTick() may be freeing this buffer on the loop task right now
+    // (a timeout firing as a late frag lands). Re-test _seqChunks INSIDE the lock —
+    // the check at the top of this function is only a cheap early-out.
+    portENTER_CRITICAL(&_seqMux);
+    if (_seqChunks && !(_seqReceivedMask & (1 << pkt.chunkIdx))) {
+        char* slot = _seqChunks + (size_t)pkt.chunkIdx * (WCB_SEQ_PAYLOAD_SIZE + 1);
+        memcpy(slot, pkt.payload, WCB_SEQ_PAYLOAD_SIZE);
+        slot[WCB_SEQ_PAYLOAD_SIZE] = '\0';
+        _seqReceivedMask |= (1 << pkt.chunkIdx);
+        if (_seqReceivedMask == (uint16_t)((1 << _seqTotalChunks) - 1)) _seqComplete = true;
+    }
+    portEXIT_CRITICAL(&_seqMux);
+    return true;
+}
+
+// Loop task: deliver a completed inventory, or abandon a request that timed out.
+void WCB_Client::_seqTick(unsigned long now) {
+    if (!_seqPending) return;
+
+    if (_seqComplete) {
+        // Take the buffer away from the RX task first, under the lock, so the
+        // reassembly below reads memory nothing else can touch.
+        portENTER_CRITICAL(&_seqMux);
+        char*   buf   = _seqChunks;
+        uint8_t total = _seqTotalChunks;
+        _seqChunks    = nullptr;
+        _seqPending   = false;
+        portEXIT_CRITICAL(&_seqMux);
+        if (!buf) { _seqReset(); return; }
+
+        // Reassemble. Payload is "<hash8hex>,<count>[,<key>...]" — parse the header
+        // here so every consumer doesn't reimplement it.
+        String full;
+        for (int i = 0; i < total; i++)
+            full += (const char*)(buf + (size_t)i * (WCB_SEQ_PAYLOAD_SIZE + 1));
+        free(buf);
+
+        uint8_t  src   = _seqTargetWCB;
+        uint32_t hash  = 0;
+        uint16_t count = 0;
+        const char* names = "";
+
+        int c1 = full.indexOf(',');
+        int c2 = (c1 >= 0) ? full.indexOf(',', c1 + 1) : -1;
+        if (c1 > 0) {
+            hash  = (uint32_t)strtoul(full.substring(0, c1).c_str(), nullptr, 16);
+            count = (uint16_t)full.substring(c1 + 1, (c2 >= 0) ? c2 : full.length()).toInt();
+        }
+        // c2 < 0 means a zero-length list ("<hash>,0") — names stays "".
+        String nameList = (c2 >= 0) ? full.substring(c2 + 1) : String("");
+        names = nameList.c_str();
+
+        WCBSequenceNamesCallback cb = _seqNamesCallback;
+        // Clear in-flight state BEFORE the callback so the consumer may issue the
+        // next requestSequenceNames() from inside it. `nameList` outlives _seqReset()
+        // because it's a local copy, not a view into the freed buffer.
+        _seqReset();
+        if (cb) cb(src, hash, count, names);
+        return;
+    }
+
+    if ((long)(now - _seqDeadlineMs) >= 0) {
+        // Silent abandon — the caller polls sequenceNamesPending() or just retries.
+        // No callback: firing one with a half-list would look like a real answer.
+        _seqReset();
+    }
+}
+
 // Enable/disable auto-join. Turning it OFF stops NEW boards from being learned;
 // already-registered learned peers stay until they age out or the device
 // restarts. Turning it ON lets subsequently-heard boards join.
@@ -1543,6 +1717,10 @@ void WCB_Client::_sendHeartbeat() {
 #define WCB_WDP_TLV_PORTLABEL 0x09  // [port][label] — one per labeled serial port
 #define WCB_WDP_TLV_CTRLID    0x0A  // uint8  — controller (special-peer) ID
 #define WCB_WDP_TLV_MAESTRO_CFG 0x0E // [id][baudCode] records — rich Maestro id+baud
+#define WCB_WDP_TLV_SEQHASH   0x13  // [hash:4 LE] — stored-sequence inventory fingerprint.
+                                    // A change means "re-pull my sequence names"
+                                    // (requestSequenceNames). Names are deliberately not
+                                    // advertised — they would not fit the 200 B payload.
 
 // Ordered, APPEND-ONLY Maestro baud table. The array INDEX is the wire code
 // carried in WCB_WDP_TLV_MAESTRO_CFG, so this must stay byte-identical to the
@@ -1742,6 +1920,10 @@ void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
                 int L = len > 48 ? 48 : len; memcpy(nb.capTags, val, L); nb.capTags[L] = '\0'; break;
             }
             case WCB_WDP_TLV_CTRLID:  if (len >= 1) nb.ctrlId = val[0]; break;
+            case WCB_WDP_TLV_SEQHASH:   // stored-sequence inventory fingerprint (LE)
+                if (len >= 4) nb.seqHash = (uint32_t)val[0]         | ((uint32_t)val[1] << 8) |
+                                           ((uint32_t)val[2] << 16) | ((uint32_t)val[3] << 24);
+                break;
             case WCB_WDP_TLV_FLAGS:   // advert flags bitmap — currently just the "temporary" bit
                 if (len >= 1) nb.temporary = (val[0] & WCB_WDP_ADVFLAG_TEMPORARY) != 0;
                 break;
@@ -2209,6 +2391,12 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
     // mesh without forking the receive path. Undersized junk with no hook
     // registered is simply dropped (same as the previous `< sizeof` guard).
     if (len != (int)sizeof(wcb_packet_etm_t)) {
+        // A stored-sequence inventory reply we asked for? Consume it here rather
+        // than making every consumer hand-roll the reassembly. Only intercepts
+        // while a request is actually in flight and the packet passes every check,
+        // so a sketch that never calls requestSequenceNames() sees the raw hook
+        // behave exactly as it always has.
+        if (_maybeHandleSeqFrag(data, len)) return;
         if (_rawPacketCallback) _rawPacketCallback(mac, data, len);
         return;
     }

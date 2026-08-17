@@ -463,6 +463,54 @@ wcb.setAutoJoin(false);
 
 ---
 
+### Stored-sequence inventory
+
+Ask a WCB which stored sequences it has, **by name**, so a controller can build its command
+list from the live mesh instead of a hard-coded snapshot that goes stale the first time
+someone saves one from the Wizard.
+
+```cpp
+void onSequenceNames(WCBSequenceNamesCallback callback);
+bool requestSequenceNames(uint8_t wcbNumber);
+bool sequenceNamesPending() const;
+```
+
+```cpp
+wcb.onSequenceNames([](uint8_t n, uint32_t hash, uint16_t count, const char* names) {
+    // names = "wave,park,scream"  — comma-separated, "" when count == 0
+    // Fires on the LOOP task, so allocation / flash I/O here is safe.
+});
+wcb.requestSequenceNames(3);
+```
+
+**Don't poll this.** Every WDP advert carries a 4-byte fingerprint of that board's
+inventory, so you can request only when it has actually changed:
+
+```cpp
+const WCBNeighbor* nb = wcb.getNeighbor(3);
+if (nb && nb->seqHash != 0 && nb->seqHash != myCachedHash)
+    wcb.requestSequenceNames(3);
+```
+
+A board re-advertises within ~500 ms of a config change, so a newly saved sequence appears
+within a couple of seconds while a steady mesh costs no request traffic at all.
+
+Notes:
+
+- `seqHash == 0` means the board advertised **no** hash — firmware older than the feature.
+  It does **not** mean "no sequences": an empty inventory hashes to `0x811C9DC5`.
+- **One request in flight at a time**; a second call returns `false`. Poll
+  `sequenceNamesPending()`.
+- A request with no complete answer within ~4 s is abandoned silently — no callback fires,
+  because a half-list would look like a real answer. Just call again.
+- `requestSequenceNames()` returns `false` unless a callback is registered first.
+- Names only, never contents. The values live in the board's config pull, which caps at
+  ~2912 characters for the *entire* board config and returns nothing at all when exceeded.
+
+Full example: [`examples/SequenceInventory`](examples/SequenceInventory).
+
+---
+
 ## Callbacks
 
 Both callbacks are optional. If you only need to send commands and never receive them, you can omit both entirely.
