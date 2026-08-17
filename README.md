@@ -276,9 +276,16 @@ Serial.printf("WCB2: %lu sent, %lu ackd, %lu retries, %lu failed, %lu unguarante
 | `failed` | we stopped waiting for that peer's ACK without getting one — retries exhausted, peer dropped offline, slot evicted, or a best-effort unicast that timed out |
 | `unguaranteed` | a send **asked for a pending slot and was denied one** because all `WCB_PENDING_MAX` were busy: transmitted once, never tracked, so no ACK can match it and it can never be ackd or failed. Covers an ensured send losing its guarantee *and* a best-effort unicast losing its ACK tracking. Local backpressure, not a link problem |
 
-`sent` counts **commands**; `retries` counts **extra attempts**. Total airtime for a peer is
-`sent + retries`. They are kept apart on purpose — folding retries into `sent` would let a
-link that retries constantly show a healthy-looking `ackd/sent` while flooding the mesh.
+`sent` counts **commands**; `retries` counts **extra attempts**, so `sent + retries` is the
+**delivery attempts** aimed at that peer. They are kept apart on purpose — folding retries into
+`sent` would let a link that retries constantly show a healthy-looking `ackd/sent` while
+flooding the mesh.
+
+That is attempts, **not frames on the air**. One ensured broadcast puts a single frame up but
+credits `sent` to every board it expects to ACK, so summing `sent + retries` across peers
+over-counts that frame by (N−1). Per-board *retries* are genuine separate unicast frames and do
+count once each. If you want airtime, use `getBroadcastSent()` alongside the unicast counts
+rather than this sum.
 
 **Invariant, per peer and in the aggregate:** `ackd + failed + unguaranteed <= sent`, the difference
 being commands still in flight. `resetStats()` re-credits `sent` for whatever is in flight at
@@ -643,6 +650,25 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.13.2
+
+- **`MgmtRelay`: an oversized serial line no longer broadcasts its tail to the whole mesh.**
+  The overrun guard zeroed the buffer length mid-line, which did not *drop* the line — it
+  restarted accumulation, so the tail arrived at the newline looking like a fresh command. With
+  no `;` or `?` prefix it fell through to `broadcast()`, putting an arbitrary mid-line fragment
+  on **every board**, moments after the operator was told the line was dropped. The overrun is
+  now swallowed to end-of-line. Relay firmware string bumped to `1.1` so a fixed relay is
+  identifiable in a WDP roster.
+- **`MgmtRelay`: OTA relay failures are no longer silent.** `sendRawPacket()` returns `false`
+  when the target cannot be registered as an ESP-NOW peer — most often a full peer table (the
+  cap is ~20, and auto-join makes learned peers permanent in NVS, so the set only grows). All
+  three OTA paths discarded that, so a failed `BEGIN`/`DATA`/`END` vanished with nothing on the
+  console and the host tool simply timed out with "no response via relay" / "target rejected
+  BEGIN". Each now logs the target and the likely cause.
+- **Docs:** `sent + retries` is *delivery attempts*, not frames on the air. One ensured
+  broadcast is a single frame but credits `sent` to every board it expects to ACK, so summing
+  across peers over-counts it; `getBroadcastSent()` is the frame counter. No code change.
 
 ### 1.13.0
 

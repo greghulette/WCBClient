@@ -75,7 +75,7 @@ const uint8_t DEVICE_ID    = 19;
 const uint8_t NAVICORE_ID  = WCB_SPECIAL_ID;   // = 20
 
 // This relay's firmware string, advertised over WDP so it shows up by name.
-const char*   RELAY_FW     = "1.0";
+const char*   RELAY_FW     = "1.1";
 
 // Name this relay advertises (WDP) and reports to the WCB Wizard as its alias.
 const char*   RELAY_ALIAS  = "Mgmt Relay";
@@ -542,6 +542,21 @@ void relayOtaCommand(const char* argsC) {
 
   if (target < 1 || target > WCB_MAX_BOARDS) { Serial.printf("[OTA] relay: invalid target %u\n", target); return; }
 
+  // Send and SAY SO IF IT FAILED. sendRawPacket() returns false when the target
+  // could not be registered as an ESP-NOW peer — the usual cause being a full
+  // peer table (ESP-NOW caps at ~20, and auto-join makes learned peers permanent
+  // in NVS, so the set only grows). Discarding that bool made a failed BEGIN
+  // indistinguishable from a target that never answered: the Wizard and the
+  // NaviCore config tool both just time out and report "no response via relay" /
+  // "target rejected BEGIN", with nothing whatsoever on this console. The WCB
+  // firmware surfaces the same failure on its own leg (WCB_OTA.cpp otaUnicast).
+  auto otaSend = [&](const void* p, size_t n, const char* label) {
+    if (wcb.sendRawPacket(target, (const uint8_t*)p, n)) return;
+    Serial.printf("[OTA] relay %s -> WCB%u FAILED to send — could not register the "
+                  "peer (ESP-NOW table full? cap ~20; ?WDP,DUMP reports PEERS=n)\n",
+                  label, target);
+  };
+
   if (sub == "BEGIN") {
     int p = r3.indexOf(',');
     uint32_t size   = (uint32_t)((p < 0 ? r3 : r3.substring(0, p)).toInt());
@@ -550,7 +565,7 @@ void relayOtaCommand(const char* argsC) {
     strncpy(pkt.structPassword, PASSWORD, sizeof(pkt.structPassword) - 1);
     pkt.packetType = PT_OTA_BEGIN; pkt.targetWCB = target; pkt.sourceWCB = DEVICE_ID;
     pkt.chipFamily = family; pkt.sessionId = session; pkt.imageSize = size;
-    wcb.sendRawPacket(target, (const uint8_t*)&pkt, sizeof(pkt));
+    otaSend(&pkt, sizeof(pkt), "BEGIN");
     return;
   }
 
@@ -568,7 +583,7 @@ void relayOtaCommand(const char* argsC) {
                                    (const unsigned char*)b64.c_str(), b64.length());
     if (rc != 0) { Serial.printf("[OTA] relay DATA base64 error %d\n", rc); return; }
     pkt.dataLen = (uint16_t)outLen;
-    wcb.sendRawPacket(target, (const uint8_t*)&pkt, sizeof(pkt));
+    otaSend(&pkt, sizeof(pkt), "DATA");
     return;
   }
 
@@ -577,7 +592,7 @@ void relayOtaCommand(const char* argsC) {
     strncpy(pkt.structPassword, PASSWORD, sizeof(pkt.structPassword) - 1);
     pkt.packetType = (sub == "END") ? PT_OTA_END : PT_OTA_ABORT;
     pkt.targetWCB  = target; pkt.sourceWCB = DEVICE_ID; pkt.sessionId = session;
-    wcb.sendRawPacket(target, (const uint8_t*)&pkt, sizeof(pkt));
+    otaSend(&pkt, sizeof(pkt), (sub == "END") ? "END" : "ABORT");
     return;
   }
 
@@ -743,6 +758,13 @@ void setup() {
 // acks, then nothing transfers). Sized with headroom so DATA lines pass intact.
 char   inBuf[384];
 size_t inLen = 0;
+// Set when a line overruns inBuf, cleared at the next newline. Without it, zeroing
+// inLen mid-line does not DROP the line — it restarts accumulation, so the tail of
+// an oversized line is treated as a fresh command at the newline. An unprefixed
+// tail falls through relaySerialLine() to wcb.broadcast(), putting an arbitrary
+// mid-line fragment on EVERY board on the mesh moments after the operator was told
+// the line was dropped. Suppress to end-of-line instead.
+bool   inOverrun = false;
 
 void loop() {
     wcb.update();                            // heartbeats out, offline detection, WDP, retries
@@ -768,11 +790,17 @@ void loop() {
     while (Serial.available()) {
         char c = (char)Serial.read();
         if (c == '\n' || c == '\r') {
-            if (inLen) { inBuf[inLen] = '\0'; relaySerialLine(inBuf); inLen = 0; }
+            // End of line: relay it, unless the line overran — then drop the WHOLE
+            // line (nothing has been relayed) and re-arm for the next one.
+            if (inOverrun) { inOverrun = false; inLen = 0; }
+            else if (inLen) { inBuf[inLen] = '\0'; relaySerialLine(inBuf); inLen = 0; }
+        } else if (inOverrun) {
+            continue;                         // still swallowing an oversized line
         } else if (inLen < sizeof(inBuf) - 1) {
             inBuf[inLen++] = c;
         } else {
-            inLen = 0;                        // overrun — drop the oversized line
+            inOverrun = true;                 // overrun — swallow to end-of-line
+            inLen     = 0;
             Serial.println("[relay] line too long — dropped (use the Config Tool for big configs)");
         }
     }

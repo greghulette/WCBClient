@@ -257,9 +257,15 @@ struct WCBPending {
 // An airtime metric, if it is ever wanted, needs its own counter — not this one.
 //
 // WHY sent AND retries ARE SEPARATE: `sent` counts COMMANDS, `retries` counts
-// EXTRA attempts; total airtime for a peer is sent + retries. Folding retries
-// into `sent` would let a link that retries constantly show a healthy-looking
-// ackd/sent ratio while flooding the mesh.
+// EXTRA attempts, so sent + retries is the DELIVERY ATTEMPTS aimed at that peer.
+// Folding retries into `sent` would let a link that retries constantly show a
+// healthy-looking ackd/sent ratio while flooding the mesh.
+//   That is attempts, NOT frames on the air, and the two differ for broadcasts:
+// one ensured broadcast puts ONE frame up but credits `sent` to every board in
+// expected[], so summing sent+retries across peers over-counts the initial frame
+// by (N-1). Per-board RETRIES are genuinely separate unicast frames, so those do
+// count once each. getBroadcastSent() is the frame counter; use it, not this sum,
+// if what you want is airtime.
 //
 // INVARIANT, per peer AND in the aggregate:  ackd + failed + unguaranteed <= sent
 // The difference is commands still in flight. Observing the left side exceed
