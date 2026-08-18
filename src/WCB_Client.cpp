@@ -1190,11 +1190,27 @@ static_assert(sizeof(wcb_packet_seq_req_t)  == 43,
               "wcb_packet_seq_req_t must match the firmware's espnow_struct_config_req (43 B)");
 static_assert(sizeof(wcb_packet_seq_frag_t) == 230,
               "wcb_packet_seq_frag_t must match the firmware's espnow_struct_config_frag (230 B)");
+static_assert(sizeof(wcb_packet_seqval_req_t) == 59,
+              "wcb_packet_seqval_req_t must match the firmware's espnow_struct_seqval_req (59 B)");
 
 #define WCB_SEQ_TIMEOUT_MS 4000   // generous: 3x REQ + up to 16 frags at 20 ms apart
 
 void WCB_Client::onSequenceNames(WCBSequenceNamesCallback callback) {
     _seqNamesCallback = callback;
+}
+
+void WCB_Client::onSequenceValue(WCBSequenceValueCallback callback) {
+    _seqValueCallback = callback;
+}
+
+// Shared key validation for every sequence call. A comma is rejected because the
+// firmware takes a stored key as everything BEFORE the first comma — a key with one
+// would be silently truncated on save and then never match on read.
+static bool wcbSeqKeyValid(const char* key) {
+    if (!key) return false;
+    size_t n = strlen(key);
+    if (n == 0 || n > WCB_SEQ_KEY_MAX) return false;
+    return strchr(key, ',') == nullptr;
 }
 
 // Detach the reassembly buffer from the RX task, then free it. The detach must be
@@ -1208,6 +1224,8 @@ void WCB_Client::_seqReset() {
     _seqPending  = false;
     portEXIT_CRITICAL(&_seqMux);
     if (doomed) free(doomed);
+    _seqWantFrag     = 0;
+    _seqReqKey[0]    = '\0';
     _seqTargetWCB    = 0;
     _seqSessionId    = 0;
     _seqTotalChunks  = 0;
@@ -1226,6 +1244,8 @@ bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
     if (!_seqChunks) return false;
 
     _seqPending      = true;
+    _seqWantFrag     = WCB_PACKET_SEQ_FRAG;
+    _seqReqKey[0]    = '\0';
     _seqTargetWCB    = wcbNumber;
     _seqSessionId    = 0;      // adopt whatever session the first frag carries
     _seqTotalChunks  = 0;
@@ -1250,6 +1270,75 @@ bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
     return true;
 }
 
+bool WCB_Client::requestSequence(uint8_t wcbNumber, const char* key) {
+    if (!_started)                                    return false;
+    if (wcbNumber < 1 || wcbNumber > WCB_MAX_BOARDS)  return false;
+    if (!wcbSeqKeyValid(key))                         return false;
+    if (_seqPending)                                  return false;   // shares the one slot
+    if (!_seqValueCallback)                           return false;
+
+    const size_t bufSize = (size_t)WCB_SEQ_MAX_CHUNKS * (WCB_SEQ_PAYLOAD_SIZE + 1);
+    _seqChunks = (char*)calloc(1, bufSize);
+    if (!_seqChunks) return false;
+
+    _seqPending      = true;
+    _seqWantFrag     = WCB_PACKET_SEQVAL_FRAG;
+    strncpy(_seqReqKey, key, sizeof(_seqReqKey) - 1);
+    _seqReqKey[sizeof(_seqReqKey) - 1] = '\0';
+    _seqTargetWCB    = wcbNumber;
+    _seqSessionId    = 0;
+    _seqTotalChunks  = 0;
+    _seqReceivedMask = 0;
+    _seqComplete     = false;
+    _seqDeadlineMs   = millis() + WCB_SEQ_TIMEOUT_MS;
+
+    wcb_packet_seqval_req_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
+    pkt.packetType   = WCB_PACKET_SEQVAL_REQ;
+    pkt.targetWCB    = wcbNumber;
+    pkt.requesterWCB = (uint8_t)_deviceID;
+    strncpy(pkt.key, key, sizeof(pkt.key) - 1);
+
+    // 3x, deduped target-side on (requester, key) — see requestSequenceNames().
+    for (int i = 0; i < 3; i++) {
+        esp_now_send(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
+        delay(15);
+    }
+    return true;
+}
+
+// ── Writing ─────────────────────────────────────────────────────────────────
+// Both writes go out as ordinary commands: send() already fragments anything over
+// one packet and the firmware already has a `?SEQ,SAVE` parser that knows not to
+// split on the '^' delimiters inside a sequence value. There is no bespoke write
+// packet, and there should not be — a second path would drift from the one the
+// Wizard and the console use.
+
+bool WCB_Client::saveSequence(uint8_t wcbNumber, const char* key, const char* value) {
+    if (!_started)                                    return false;
+    if (wcbNumber < 1 || wcbNumber > WCB_MAX_BOARDS)  return false;
+    if (!wcbSeqKeyValid(key))                         return false;
+    if (!value || *value == '\0')                     return false;   // firmware rejects an empty value
+
+    String cmd = "?SEQ,SAVE,";
+    cmd += key;
+    cmd += ",";
+    cmd += value;
+    if (cmd.length() > WCB_MGMT_MAX_COMMAND_LEN) return false;   // send() would drop it
+    return send(wcbNumber, cmd.c_str());
+}
+
+bool WCB_Client::deleteSequence(uint8_t wcbNumber, const char* key) {
+    if (!_started)                                    return false;
+    if (wcbNumber < 1 || wcbNumber > WCB_MAX_BOARDS)  return false;
+    if (!wcbSeqKeyValid(key))                         return false;
+
+    String cmd = "?SEQ,CLEAR,";
+    cmd += key;
+    return send(wcbNumber, cmd.c_str());
+}
+
 // WiFi/RX task. Keep this to memcpy + flag work only — the user callback fires
 // from _seqTick() on the loop task, where doing real work is safe.
 bool WCB_Client::_maybeHandleSeqFrag(const uint8_t* data, int len) {
@@ -1260,7 +1349,10 @@ bool WCB_Client::_maybeHandleSeqFrag(const uint8_t* data, int len) {
     memcpy(&pkt, data, sizeof(pkt));
     pkt.structPassword[sizeof(pkt.structPassword) - 1] = '\0';
 
-    if (pkt.packetType != WCB_PACKET_SEQ_FRAG)                     return false;
+    // Must be the kind of reply this slot is waiting for. A frag of the OTHER kind
+    // (a late leftover from a previous request) would otherwise be reassembled into
+    // the current one and delivered as garbage.
+    if (pkt.packetType != _seqWantFrag)                            return false;
     if (strncmp(pkt.structPassword, _password,
                 sizeof(pkt.structPassword) - 1) != 0)              return false;
     if (pkt.requesterWCB != (uint8_t)_deviceID)                    return false;
@@ -1308,17 +1400,46 @@ void WCB_Client::_seqTick(unsigned long now) {
         portEXIT_CRITICAL(&_seqMux);
         if (!buf) { _seqReset(); return; }
 
-        // Reassemble. Payload is "<hash8hex>,<count>[,<key>...]" — parse the header
-        // here so every consumer doesn't reimplement it.
         String full;
         for (int i = 0; i < total; i++)
             full += (const char*)(buf + (size_t)i * (WCB_SEQ_PAYLOAD_SIZE + 1));
         free(buf);
 
-        uint8_t  src   = _seqTargetWCB;
+        uint8_t src  = _seqTargetWCB;
+        uint8_t kind = _seqWantFrag;
+        String  askedKey(_seqReqKey);
+
+        // Both branches copy what the callback needs into locals FIRST, then clear
+        // the in-flight state, then fire — so the consumer may issue the next
+        // request from inside the callback. The locals outlive _seqReset() because
+        // they are copies, not views into the freed buffer.
+        if (kind == WCB_PACKET_SEQVAL_FRAG) {
+            // "<key>,<status>,<value>" — value may itself contain commas, so take
+            // everything after the SECOND comma verbatim.
+            String   key    = askedKey;
+            String   value  = "";
+            WCBSeqStatus st = WCB_SEQ_NOTFOUND;
+
+            int c1 = full.indexOf(',');
+            int c2 = (c1 >= 0) ? full.indexOf(',', c1 + 1) : -1;
+            if (c1 >= 0 && c2 > c1) {
+                key = full.substring(0, c1);
+                String s = full.substring(c1 + 1, c2);
+                if      (s == "OK")     { st = WCB_SEQ_OK; value = full.substring(c2 + 1); }
+                else if (s == "TOOBIG")   st = WCB_SEQ_TOOBIG;
+                else                      st = WCB_SEQ_NOTFOUND;
+            }
+
+            WCBSequenceValueCallback cb = _seqValueCallback;
+            _seqReset();
+            if (cb) cb(src, key.c_str(), st, value.c_str());
+            return;
+        }
+
+        // Names reply: "<hash8hex>,<count>[,<key>...]" — parse the header here so
+        // every consumer doesn't reimplement it.
         uint32_t hash  = 0;
         uint16_t count = 0;
-        const char* names = "";
 
         int c1 = full.indexOf(',');
         int c2 = (c1 >= 0) ? full.indexOf(',', c1 + 1) : -1;
@@ -1326,16 +1447,12 @@ void WCB_Client::_seqTick(unsigned long now) {
             hash  = (uint32_t)strtoul(full.substring(0, c1).c_str(), nullptr, 16);
             count = (uint16_t)full.substring(c1 + 1, (c2 >= 0) ? c2 : full.length()).toInt();
         }
-        // c2 < 0 means a zero-length list ("<hash>,0") — names stays "".
+        // c2 < 0 means a zero-length list ("<hash>,0") — the name list stays "".
         String nameList = (c2 >= 0) ? full.substring(c2 + 1) : String("");
-        names = nameList.c_str();
 
         WCBSequenceNamesCallback cb = _seqNamesCallback;
-        // Clear in-flight state BEFORE the callback so the consumer may issue the
-        // next requestSequenceNames() from inside it. `nameList` outlives _seqReset()
-        // because it's a local copy, not a view into the freed buffer.
         _seqReset();
-        if (cb) cb(src, hash, count, names);
+        if (cb) cb(src, hash, count, nameList.c_str());
         return;
     }
 

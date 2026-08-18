@@ -470,9 +470,16 @@ list from the live mesh instead of a hard-coded snapshot that goes stale the fir
 someone saves one from the Wizard.
 
 ```cpp
+// Read
 void onSequenceNames(WCBSequenceNamesCallback callback);
-bool requestSequenceNames(uint8_t wcbNumber);
-bool sequenceNamesPending() const;
+bool requestSequenceNames(uint8_t wcbNumber);          // what exists
+void onSequenceValue(WCBSequenceValueCallback callback);
+bool requestSequence(uint8_t wcbNumber, const char* key);   // one sequence's contents
+bool sequenceNamesPending() const;                     // gates BOTH reads
+
+// Write
+bool saveSequence(uint8_t wcbNumber, const char* key, const char* value);
+bool deleteSequence(uint8_t wcbNumber, const char* key);
 ```
 
 ```cpp
@@ -493,14 +500,43 @@ if (nb && nb->seqHash != 0 && nb->seqHash != myCachedHash)
 ```
 
 A board re-advertises within ~500 ms of a config change, so a newly saved sequence appears
-within a couple of seconds while a steady mesh costs no request traffic at all.
+within a couple of seconds while a steady mesh costs no request traffic at all. The hash
+covers stored **values** as well as names, so an in-place edit moves it too.
+
+#### Pulling contents, and pushing edits back
+
+```cpp
+wcb.onSequenceValue([](uint8_t n, const char* key, WCBSeqStatus st, const char* value) {
+    if (st == WCB_SEQ_OK) { /* value = ";M1,1^;S5,<CA1021>" */ }
+    // else WCB_SEQ_NOTFOUND / WCB_SEQ_TOOBIG — always check before trusting value
+});
+
+wcb.requestSequence(3, "wave");                          // one at a time
+wcb.saveSequence(3, "wave", ";M1,1^;S5,<CA1021>");       // create or overwrite
+wcb.deleteSequence(3, "oldname");
+```
+
+To mirror a whole board, pull the names and **walk them one at a time** — there is no
+"give me everything" call on purpose. A single value is bounded (~1800 chars, about 10 of
+the 16 chunks a reply can carry) but the total is not, so a bulk fetch would silently
+exceed it. Walking has no aggregate ceiling, lets you fetch lazily, and resumes cleanly if
+a board drops. At ~100 ms per round trip a 20-sequence board mirrors in 2–3 seconds.
+
+Issuing the next request from *inside* a callback is fine — the library clears its
+in-flight state before firing you.
+
+Writes are **fire-and-forget**: they ride the ordinary command path (auto-fragmented,
+unicast) and there is no reply packet. Confirm by watching `seqHash` change, or by reading
+the value back. Keys must be 1–15 chars with **no comma** — the firmware takes a stored key
+as everything before the first comma, so one would silently truncate it.
 
 Notes:
 
 - `seqHash == 0` means the board advertised **no** hash — firmware older than the feature.
   It does **not** mean "no sequences": an empty inventory hashes to `0x811C9DC5`.
-- **One request in flight at a time**; a second call returns `false`. Poll
-  `sequenceNamesPending()`.
+- **One request in flight at a time**, shared between `requestSequenceNames()` and
+  `requestSequence()`; a second call returns `false`. Poll `sequenceNamesPending()`, which
+  gates either kind.
 - A request with no complete answer within ~4 s is abandoned silently — no callback fires,
   because a half-list would look like a real answer. Just call again.
 - `requestSequenceNames()` returns `false` unless a callback is registered first.

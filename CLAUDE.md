@@ -58,7 +58,8 @@ Key entry points: `setIdentity()` (WDP advert — name + firmware), `setPortLabe
 -port labels the Wizard displays), `setMaestroIds()` (which Maestros this device hosts),
 `enableSpecialPeer()` (out-of-band peer such as NaviCore), `onNeighbor()`/`getNeighbor()`
 (consume adverts), `onRawPacket()`/`sendRawPacket()` (custom protocols, e.g. OTA),
-`requestSequenceNames()`/`onSequenceNames()` (pull a WCB's stored-sequence inventory).
+`requestSequenceNames()`/`requestSequence()`/`saveSequence()` (read and write a WCB's
+stored sequences).
 
 Auto-join is **on by default**: the device registers WCBs it hears as peers and remembers
 them across reboots, so `wcb_quantity` does not need to cover the fleet.
@@ -68,12 +69,23 @@ them across reboots, so `wcb_quantity` does not need to cover the fleet.
 flash I/O and allocation inside them. Both say so in the header; state the calling context
 explicitly on anything new, either way.
 
-**The sequence inventory is names, never values.** `requestSequenceNames()` exists because
-the WCB config pull carries sequence *values* and silently returns **nothing** once the whole
-config exceeds ~2912 chars. Don't "improve" it into fetching contents — that walks straight
-back into the bug it routes around. The companion `WCBNeighbor::seqHash` (WDP TLV `0x13`) is
-what makes it cheap: pull only when the fingerprint moves. Design doc lives in the WCB repo,
+**Sequence reads are one at a time, on purpose.** `requestSequenceNames()` returns names
+only; `requestSequence()` returns ONE value by key. There is deliberately no "fetch every
+sequence" call — a single value is bounded (~1800 chars ≈ 10 of 16 chunks) but the total is
+not, and the WCB config pull already demonstrates the failure mode: it carries values,
+exceeds ~2912 chars on a real board, and then returns **nothing** with the diagnostic behind
+a debug flag. Adding a bulk fetch walks straight back into that. Consumers walk the name
+list instead. `WCBNeighbor::seqHash` (WDP TLV `0x13`) covers names **and** values, so it is
+also how you confirm a write landed. Design doc lives in the WCB repo,
 `docs/SEQUENCE_INVENTORY.md`.
+
+**Writes deliberately have no wire format of their own.** `saveSequence()`/`deleteSequence()`
+build `?SEQ,SAVE`/`?SEQ,CLEAR` commands and hand them to `send()`, which already fragments
+and already gets the firmware's `?SEQ,SAVE` parser (the one that knows not to split on the
+`^` inside a value). A bespoke write packet would drift from the path the Wizard and console
+use. Keys are validated to 1–15 chars with no comma, because the firmware takes a key as
+everything before the first comma — a comma truncates silently on save and never matches on
+read.
 
 ## Conventions
 

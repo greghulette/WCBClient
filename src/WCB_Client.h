@@ -214,10 +214,13 @@ typedef struct __attribute__((packed)) {
 // real sequence set exhausts — and the target then sends NOTHING, with the "too
 // large" diagnostic behind a debug flag. An inventory is ~16 bytes per entry.
 // ─────────────────────────────────────────────────────────────────────────────
-#define WCB_PACKET_SEQ_REQ    13   // firmware PACKET_TYPE_SEQ_REQ  (this → target)
-#define WCB_PACKET_SEQ_FRAG   14   // firmware PACKET_TYPE_SEQ_FRAG (target → this)
+#define WCB_PACKET_SEQ_REQ     13  // firmware PACKET_TYPE_SEQ_REQ     (this → target)
+#define WCB_PACKET_SEQ_FRAG    14  // firmware PACKET_TYPE_SEQ_FRAG    (target → this)
+#define WCB_PACKET_SEQVAL_REQ  15  // firmware PACKET_TYPE_SEQVAL_REQ  (this → target)
+#define WCB_PACKET_SEQVAL_FRAG 16  // firmware PACKET_TYPE_SEQVAL_FRAG (target → this)
 #define WCB_SEQ_PAYLOAD_SIZE  183  // firmware CONFIG_PAYLOAD_SIZE
 #define WCB_SEQ_MAX_CHUNKS    16   // firmware MGMT_MAX_CHUNKS (uint16 mask)
+#define WCB_SEQ_KEY_MAX       15   // NVS key limit — a longer key cannot be stored at all
 
 typedef struct __attribute__((packed)) {
     char    structPassword[40];
@@ -225,6 +228,18 @@ typedef struct __attribute__((packed)) {
     uint8_t targetWCB;             // board to ask
     uint8_t requesterWCB;          // this device's ID — the target answers only this
 } wcb_packet_seq_req_t;
+
+// Single-sequence request (59 B). Separate from the 43-byte request above purely
+// because it must carry the key. Sending `?SEQ,GET,<key>` as an ordinary command
+// would NOT work: a command arriving over ESP-NOW does not carry its sender into
+// the firmware's handler, so the target could not tell who to answer.
+typedef struct __attribute__((packed)) {
+    char    structPassword[40];
+    uint8_t packetType;            // WCB_PACKET_SEQVAL_REQ
+    uint8_t targetWCB;
+    uint8_t requesterWCB;
+    char    key[16];               // NUL-terminated, ≤15 chars
+} wcb_packet_seqval_req_t;
 
 typedef struct __attribute__((packed)) {
     char     structPassword[40];
@@ -434,6 +449,28 @@ typedef void (*WCBNeighborCallback)(const WCBNeighbor& nb);
 // copy anything you need to keep.
 typedef void (*WCBSequenceNamesCallback)(uint8_t wcbNumber, uint32_t hash,
                                          uint16_t count, const char* names);
+
+// Outcome of a requestSequence() — the target distinguishes these explicitly rather
+// than answering with silence, which is what makes the config-pull path unusable.
+enum WCBSeqStatus : uint8_t {
+    WCB_SEQ_OK       = 0,   // `value` holds the sequence
+    WCB_SEQ_NOTFOUND = 1,   // no such key on that board (`value` empty)
+    WCB_SEQ_TOOBIG   = 2,   // stored value exceeds what one reply can carry (`value` empty)
+};
+
+// Called when a board answers requestSequence() with ONE sequence's contents.
+// FIRES ON THE LOOP TASK (from update()) — safe to allocate / touch flash.
+//   wcbNumber : the board that answered
+//   key       : the sequence key that was asked for (echoed back, so a consumer
+//               walking a list can match the answer to its request)
+//   status    : see WCBSeqStatus — always check this before trusting `value`
+//   value     : the stored sequence, NUL-terminated; "" unless status is WCB_SEQ_OK.
+//               Commands inside it are separated by the board's delimiter
+//               (normally '^'), and `***` marks an inline comment.
+// `key` and `value` point at library-owned memory freed when the callback
+// returns — copy anything you need to keep.
+typedef void (*WCBSequenceValueCallback)(uint8_t wcbNumber, const char* key,
+                                         WCBSeqStatus status, const char* value);
 
 // ── Bulk-transfer callbacks (see onBulkBegin/onBulkChunk/onBulkComplete) ──────
 // ALL THREE FIRE ON THE LOOP TASK (from update()), never the RX/WiFi task, so the
@@ -770,8 +807,58 @@ public:
     // allocated (~3 KB, held only while the request is in flight).
     bool requestSequenceNames(uint8_t wcbNumber);
 
-    // True while a requestSequenceNames() is awaiting its reply.
+    // True while a requestSequenceNames() or requestSequence() is awaiting its
+    // reply. Both share one reassembly slot, so this gates either kind.
     bool sequenceNamesPending() const { return _seqPending; }
+
+    // Register the callback fired when a board answers requestSequence().
+    // Like onSequenceNames(), registering it also arms interception of the reply.
+    void onSequenceValue(WCBSequenceValueCallback callback);
+
+    // Fetch ONE sequence's full contents from `wcbNumber` by key.
+    //
+    // Deliberately one at a time. A single value is bounded (~1800 chars, about 10
+    // of the 16 available chunks) but the whole set is not — pull the name list with
+    // requestSequenceNames() and walk it, which has no aggregate ceiling, fetches
+    // lazily, and resumes cleanly if a board drops mid-walk.
+    //
+    // Shares the single in-flight slot with requestSequenceNames(): returns false if
+    // either is already pending. Same ~4 s silent abandon.
+    //
+    // Returns false if: not started, `wcbNumber` out of range, key empty or longer
+    // than WCB_SEQ_KEY_MAX, a request is already pending, no callback registered, or
+    // the reassembly buffer couldn't be allocated.
+    bool requestSequence(uint8_t wcbNumber, const char* key);
+
+    // ── Writing sequences ─────────────────────────────────────────────────────
+
+    // Save (create or overwrite) a stored sequence on `wcbNumber`.
+    //
+    // `value` is the sequence body: commands separated by the board's delimiter
+    // (normally '^'), e.g. ";M1,1^;S5,<CA1021>". `***text` in a part is an inline
+    // comment, kept in storage and stripped at recall.
+    //
+    // Sent as a normal command, so it rides the library's automatic fragmentation
+    // (up to WCB_MGMT_MAX_COMMAND_LEN) and the firmware's `?SEQ,SAVE` parser, which
+    // deliberately does NOT split on the '^' characters inside the value. It is
+    // delivered with UNICAST semantics, so it applies to that board only rather than
+    // fanning out across the mesh.
+    //
+    // FIRE AND FORGET at the API level. There is no per-save reply packet — confirm
+    // it landed by watching the target's WCBNeighbor::seqHash change (WDP
+    // re-advertises within ~500 ms of the write) or by reading the value back with
+    // requestSequence(). The hash covers stored VALUES as well as names, so an
+    // in-place edit moves it too.
+    //
+    // Returns false if: not started, `wcbNumber` out of range, key empty / longer
+    // than WCB_SEQ_KEY_MAX / containing a comma (the firmware takes the key as
+    // everything before the first comma, so one would silently truncate it), value
+    // empty, or the assembled command exceeds what send() can fragment.
+    bool saveSequence(uint8_t wcbNumber, const char* key, const char* value);
+
+    // Delete one stored sequence from `wcbNumber` (the firmware's ?SEQ,CLEAR,<key>).
+    // Same fire-and-forget contract and same key validation as saveSequence().
+    bool deleteSequence(uint8_t wcbNumber, const char* key);
 
     // Auto-join (default ON): when this device decodes a WDP advert from a node
     // it isn't already peered with — a WCB OR a client device (mesh monitor, other
@@ -1268,7 +1355,14 @@ private:
     // library this widely included shouldn't cost every sketch 3 KB of BSS for a
     // feature most don't use.
     WCBSequenceNamesCallback _seqNamesCallback = nullptr;
+    WCBSequenceValueCallback _seqValueCallback = nullptr;
     bool          _seqPending     = false;   // a request is awaiting its reply
+    // Which reply this slot is waiting for — WCB_PACKET_SEQ_FRAG (names) or
+    // WCB_PACKET_SEQVAL_FRAG (one value). Both kinds share one buffer and one
+    // in-flight slot, so a stray frag of the other kind is ignored rather than
+    // corrupting the reassembly.
+    uint8_t       _seqWantFrag    = 0;
+    char          _seqReqKey[16]  = {0};     // key asked for (SEQVAL only), echoed to the callback
     uint8_t       _seqTargetWCB   = 0;       // board we asked
     uint16_t      _seqSessionId   = 0;       // session of the frags being reassembled (0 = none yet)
     uint8_t       _seqTotalChunks = 0;

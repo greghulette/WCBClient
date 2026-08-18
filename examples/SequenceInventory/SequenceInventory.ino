@@ -27,6 +27,19 @@
   So a saved sequence on any WCB shows up here within a couple of seconds, and a
   mesh that is not changing costs zero request traffic.
 
+  Then it does the other two thirds of the job:
+    • requestSequence()  pulls ONE sequence's full contents, by key. Walk the name
+      list to mirror a whole board; each reply is individually bounded, so there is
+      no aggregate ceiling and a dropped board just resumes where it left off.
+    • saveSequence() / deleteSequence()  push edits and new sequences back.
+
+  Type in the serial monitor to drive it:
+      list                    re-pull every board's names
+      get <wcb> <key>         fetch one sequence
+      mirror <wcb>            fetch every sequence on a board, one at a time
+      save <wcb> <key> <val>  create or overwrite
+      del  <wcb> <key>        delete
+
   Flash to any ESP32 board — no wiring required, everything is wireless.
 */
 
@@ -65,6 +78,28 @@ BoardSeqs gSeqs[WCB_MAX_BOARDS];
 // and let each update() tick issue at most one.
 uint8_t gScanCursor = 1;
 
+// ── "mirror" state: fetch every sequence on one board, one at a time ─────────
+// This is the intended way to pull a whole board. There is deliberately no
+// "give me everything" packet: the total is unbounded and would silently exceed
+// what one reply can carry, whereas a single sequence never does.
+uint8_t gMirrorWCB   = 0;    // 0 = not mirroring
+int     gMirrorIndex = 0;    // which name we're on
+
+// Pull name N out of a comma-separated list ("" if past the end).
+String nthName(const String& list, int n) {
+    int start = 0;
+    while (start <= (int)list.length()) {
+        int comma = list.indexOf(',', start);
+        if (comma < 0) comma = list.length();
+        String key = list.substring(start, comma);
+        key.trim();
+        if (key.length() > 0 && n-- == 0) return key;   // blanks don't consume an index
+        if (comma >= (int)list.length()) break;
+        start = comma + 1;
+    }
+    return "";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The inventory arrived. Fires on the LOOP task, so doing real work here is safe.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +130,40 @@ void onSequenceNames(uint8_t wcbNumber, uint32_t hash, uint16_t count, const cha
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// One sequence's full contents arrived. Also on the LOOP task.
+// ALWAYS check status before trusting value — the board tells us explicitly when
+// a key is missing or too large, rather than answering with silence.
+// ─────────────────────────────────────────────────────────────────────────────
+void onSequenceValue(uint8_t wcbNumber, const char* key, WCBSeqStatus status, const char* value) {
+    switch (status) {
+        case WCB_SEQ_OK:
+            Serial.printf("\n[SEQ] WCB%d  %s  (%u chars)\n", wcbNumber, key, strlen(value));
+            Serial.printf("        %s\n", value);
+            break;
+        case WCB_SEQ_NOTFOUND:
+            Serial.printf("\n[SEQ] WCB%d  %s  — no such sequence\n", wcbNumber, key);
+            break;
+        case WCB_SEQ_TOOBIG:
+            Serial.printf("\n[SEQ] WCB%d  %s  — too large to send in one reply\n", wcbNumber, key);
+            break;
+    }
+
+    // If we're mirroring a board, step to the next name. Issuing the next request
+    // from inside the callback is safe: the library clears its in-flight state
+    // before firing us.
+    if (gMirrorWCB == wcbNumber) {
+        String next = nthName(gSeqs[wcbNumber - 1].names, ++gMirrorIndex);
+        if (next.length() == 0) {
+            Serial.printf("[SEQ] WCB%d mirror complete (%d sequences)\n",
+                          wcbNumber, gMirrorIndex);
+            gMirrorWCB = 0;
+        } else if (!wcb.requestSequence(wcbNumber, next.c_str())) {
+            Serial.printf("[SEQ] mirror stalled at '%s' — retrying from loop\n", next.c_str());
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // A neighbor advert was decoded. Runs on the WiFi task — so DON'T request from
 // here; just note it and let loop() act. (We don't even need this callback for
 // the refresh logic below, which polls getNeighbor(); it's here to show that the
@@ -115,6 +184,7 @@ void setup() {
     Serial.println("\n=== WCB_Client — Sequence Inventory ===\n");
 
     wcb.onSequenceNames(onSequenceNames);
+    wcb.onSequenceValue(onSequenceValue);
     wcb.onNeighbor(onNeighbor);
 
     // Advertise ourselves so the WCBs know we exist (and so this device shows up
@@ -125,16 +195,89 @@ void setup() {
         Serial.println("ERROR: wcb.begin() failed — check credentials/ESP-NOW init");
         return;
     }
-    Serial.println("Listening for WDP adverts. Sequence lists refresh on change.\n");
+    Serial.println("Listening for WDP adverts. Sequence lists refresh on change.");
+    Serial.println("Commands: list | get <wcb> <key> | mirror <wcb> | save <wcb> <key> <val> | del <wcb> <key>\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serial console — drive the three operations by hand.
+// ─────────────────────────────────────────────────────────────────────────────
+void handleConsole() {
+    if (!Serial.available()) return;
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    // verb [wcb] [key] [value...]  — value keeps its spaces
+    String verb = line; String rest = "";
+    int sp = line.indexOf(' ');
+    if (sp > 0) { verb = line.substring(0, sp); rest = line.substring(sp + 1); rest.trim(); }
+    verb.toLowerCase();
+
+    auto nextTok = [&rest]() -> String {
+        int s = rest.indexOf(' ');
+        String t = (s < 0) ? rest : rest.substring(0, s);
+        rest = (s < 0) ? "" : rest.substring(s + 1);
+        rest.trim(); t.trim();
+        return t;
+    };
+
+    if (verb == "list") {
+        // Forget every cached hash so the loop re-pulls all of them.
+        for (int i = 0; i < WCB_MAX_BOARDS; i++) gSeqs[i].knownHash = 0;
+        Serial.println("[SEQ] refreshing all boards…");
+        return;
+    }
+
+    uint8_t n = (uint8_t)nextTok().toInt();
+    if (n < 1 || n > WCB_MAX_BOARDS) { Serial.println("usage: <verb> <wcb 1-20> …"); return; }
+
+    if (verb == "get") {
+        String key = nextTok();
+        if (!wcb.requestSequence(n, key.c_str()))
+            Serial.println("[SEQ] request refused — busy, bad key, or no callback");
+
+    } else if (verb == "mirror") {
+        if (gSeqs[n - 1].count == 0) { Serial.printf("[SEQ] no names cached for WCB%d yet\n", n); return; }
+        gMirrorWCB   = n;
+        gMirrorIndex = 0;
+        String first = nthName(gSeqs[n - 1].names, 0);
+        Serial.printf("[SEQ] mirroring WCB%d (%u sequences)…\n", n, gSeqs[n - 1].count);
+        if (!wcb.requestSequence(n, first.c_str())) Serial.println("[SEQ] busy — try again");
+
+    } else if (verb == "save") {
+        String key = nextTok();
+        String val = rest;                       // everything left, spaces intact
+        if (val.length() == 0) { Serial.println("usage: save <wcb> <key> <value>"); return; }
+        if (wcb.saveSequence(n, key.c_str(), val.c_str()))
+            Serial.printf("[SEQ] saved '%s' to WCB%d — watch its hash change to confirm\n",
+                          key.c_str(), n);
+        else
+            Serial.println("[SEQ] save refused — key must be 1-15 chars, no comma; value non-empty");
+
+    } else if (verb == "del") {
+        String key = nextTok();
+        if (wcb.deleteSequence(n, key.c_str()))
+            Serial.printf("[SEQ] delete sent for '%s' on WCB%d\n", key.c_str(), n);
+        else
+            Serial.println("[SEQ] delete refused — check the key");
+
+    } else {
+        Serial.println("commands: list | get <wcb> <key> | mirror <wcb> | save <wcb> <key> <val> | del <wcb> <key>");
+    }
 }
 
 void loop() {
     wcb.update();
+    handleConsole();
 
     // One request at a time. Walk the boards; for each, compare the hash it is
     // advertising against the one we last pulled with, and refresh on a mismatch.
     // A steady mesh issues nothing at all.
-    if (!wcb.sequenceNamesPending()) {
+    //
+    // A mirror walk owns the slot until it finishes, so don't start a name refresh
+    // underneath it.
+    if (!wcb.sequenceNamesPending() && gMirrorWCB == 0) {
         for (uint8_t i = 0; i < WCB_MAX_BOARDS; i++) {
             uint8_t n = gScanCursor;
             gScanCursor = (gScanCursor % WCB_MAX_BOARDS) + 1;
