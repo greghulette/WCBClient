@@ -1827,6 +1827,8 @@ void WCB_Client::_sendHeartbeat() {
 #define WCB_WDP_ADVFLAG_TEMPORARY 0x01  // "adopt me TEMPORARY" — WCBs keep it live but NOT
                                         // persisted (dropped on silence/reboot). See setTemporary().
 // Decode-only TLVs (WCBs advertise these; the consumer below reads them).
+#define WCB_WDP_TLV_SOLICIT   0x11  // len 0 — "everyone advertise now" (?WDP,POLL). Carries no
+                                    // facts, so it must NOT be decoded as an advert.
 #define WCB_WDP_TLV_ALIAS     0x01  // string — WCB alias
 #define WCB_WDP_TLV_HWVER     0x04  // uint8  — WCB numeric hardware version
 #define WCB_WDP_TLV_CAPFLAGS  0x05  // uint16 LE — WCB capability bitmap
@@ -2001,6 +2003,40 @@ void WCB_Client::_wdpTick() {
 void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
     if (senderWCB < 1 || senderWCB > WCB_MAX_BOARDS) return;
     if (cmd[0] != (uint8_t)WCB_WDP_MAGIC || cmd[1] != WCB_WDP_PROTO) return;
+
+    // Solicitation check FIRST, exactly as the WCB firmware does (WCB_WDP.cpp). A bare
+    // SOLICIT is indistinguishable from an advert at the packet layer — same magic, same
+    // proto, same WDP packet type — but carries NO facts. Falling through would memset the
+    // sending board’s neighbor record and rebuild it from an empty TLV list, so every
+    // "Poll mesh" / ?WDP,POLL blanked the alias, port labels, capability flags, Maestro ids
+    // and seqHash of the board that sent it, for up to 60 s until its next real advert.
+    {
+        int s = 2;
+        while (s + 2 <= 200) {
+            uint8_t ty = cmd[s];
+            if (ty == WCB_WDP_TLV_END) break;
+            int ln = cmd[s + 1];
+            if (s + 2 + ln > 200) break;
+            if (ty == WCB_WDP_TLV_SOLICIT) {
+                // Answer it, but NOT from here. This function runs on the ESP-NOW receive
+                // callback (WiFi task, small stack) — see the CRITICAL note below — and
+                // _sendWdpAdvert() stack-allocates a 252-byte packet and calls esp_now_send.
+                // Arm the boot-burst timer instead and let _wdpTick() send it from update(),
+                // staggered by device id so a fleet does not answer in lockstep. Mirrors the
+                // firmware’s wdpArmSolicitedAdvert(): arm if idle, or pull a pending burst
+                // earlier, never lengthen a larger one. Without this the client stays deaf to
+                // the poll and its row never refreshes in the mesh panel.
+                if (_wdpType[0]) {
+                    unsigned long now    = millis();
+                    unsigned long jitter = (unsigned long)((_deviceID % 16) * 40);   // 0..600 ms
+                    if (_wdpBootLeft < 1) { _wdpBootLeft = 1; _wdpNextBootMs = now + jitter; }
+                    else if ((long)((now + jitter) - _wdpNextBootMs) < 0) _wdpNextBootMs = now + jitter;
+                }
+                return;   // do NOT touch the neighbor table
+            }
+            s += 2 + ln;
+        }
+    }
 
     WCBNeighbor& nb = _neighbors[senderWCB - 1];
     memset(&nb, 0, sizeof(nb));            // a board is the sole authority for its facts — replace wholesale
