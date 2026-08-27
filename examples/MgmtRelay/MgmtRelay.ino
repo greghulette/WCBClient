@@ -520,6 +520,20 @@ void processRemoteTerm(const uint8_t* data) {
   Serial.printf("[TERM:%d]%s\n", pkt.sourceWCB, line);
 }
 
+// CRC-32 (reflected, poly 0xEDB88320) — byte-for-byte the same function as
+// WCB.ino's calculateCRC32(), navicore_ota.h's otaCrc32() and the config tool's
+// _crc32Hex(). All four must agree: the tool computes it and whichever relay is
+// in the path verifies it.
+static uint32_t relayCrc32(const String &data) {
+  const uint8_t *b = (const uint8_t *)data.c_str();
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < data.length(); i++) {
+    crc ^= b[i];
+    for (int j = 0; j < 8; j++) crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return ~crc;
+}
+
 // ── Phase 3: OTA relay ────────────────────────────────────────────────────────
 // Forward a Wizard "?OTA,<sub>,<target>,<session>,…" line to the target as the matching
 // ESP-NOW OTA packet. Mirrors navicore_ota.h processOtaRelayCommand / WCB_OTA.cpp exactly:
@@ -571,9 +585,30 @@ void relayOtaCommand(const char* argsC) {
 
   if (sub == "DATA") {
     int p = r3.indexOf(',');
-    if (p < 0) { Serial.println("[OTA] relay DATA usage: ?OTA,DATA,<t>,<s>,<offset>,<b64>"); return; }
-    uint32_t offset = (uint32_t)r3.substring(0, p).toInt();
+    if (p < 0) { Serial.println("[OTA] relay DATA usage: ?OTA,DATA,<t>,<s>,<offset>[:<crc32>],<b64>"); return; }
+    String offField = r3.substring(0, p);
     String   b64    = r3.substring(p + 1); b64.trim();
+    // Optional integrity suffix on the OFFSET field: "<offset>:<crc32hex>" over
+    // "<offset>,<b64>" as transmitted. It rides on the offset because toInt()
+    // stops at the ':', so a relay or a sender predating it still interoperates —
+    // appending a trailing field would have been swept into the base64 and failed
+    // EVERY packet. Dropping a failed line turns silent serial corruption into
+    // ordinary loss, which the target's cursor/ACK protocol already recovers from:
+    // it does not advance, and the sender rewinds and resends. The ESP-NOW hop
+    // needs no cover — 802.11 CRCs every frame in hardware.
+    int cpos = offField.indexOf(':');
+    String crcHex;
+    if (cpos >= 0) { crcHex = offField.substring(cpos + 1); offField = offField.substring(0, cpos); }
+    uint32_t offset = (uint32_t)offField.toInt();
+    if (crcHex.length()) {
+      const uint32_t want = (uint32_t)strtoul(crcHex.c_str(), nullptr, 16);
+      const uint32_t have = relayCrc32(offField + "," + b64);
+      if (want != have) {
+        Serial.printf("[OTA] relay DATA @%lu DROPPED: crc %08X != %08X (b64 %u chars)\n",
+                      (unsigned long)offset, (unsigned)have, (unsigned)want, (unsigned)b64.length());
+        return;   // target cursor stalls -> sender rewinds and resends
+      }
+    }
     relay_ota_data pkt; memset(&pkt, 0, sizeof(pkt));
     strncpy(pkt.structPassword, PASSWORD, sizeof(pkt.structPassword) - 1);
     pkt.packetType = PT_OTA_DATA; pkt.targetWCB = target; pkt.sourceWCB = DEVICE_ID;
@@ -711,6 +746,18 @@ void relaySerialLine(char* line) {
 }
 
 void setup() {
+    // RX headroom BEFORE begin(). The default ring is 256 B, and a relayed OTA
+    // streams a window of 8 ?OTA,DATA lines of ~284 B = 2272 B — so the ring only
+    // survives while this loop keeps draining it, and one stall (an inline
+    // ESP-NOW send is enough) overflows it. That does not merely LOSE a line: it
+    // drops a contiguous run of bytes from the MIDDLE of one, and if the run
+    // falls inside the base64 field with the newline intact, the remainder is
+    // STILL valid base64 and STILL decodes to a shorter, re-phased byte string.
+    // We would forward it as a normal fragment at the offset the sender named,
+    // the target would write it and advance its cursor, and nothing would notice
+    // until the SHA at 100%. 8 KB holds ~28 such lines. Works for both a
+    // HardwareSerial UART0 and a native-USB HWCDC Serial.
+    Serial.setRxBufferSize(8192);
     Serial.begin(115200);
     // Queue for inbound mesh lines, printed from loop() (see the RelayLine note).
     // Created before begin() so it exists before the receive callback can fire.
