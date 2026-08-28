@@ -65,10 +65,10 @@
 //   PASSWORD            : the ESP-NOW network password (?WCBP)
 //   WCB_QUANTITY        : total number of WCBs in the system (?WCBQ)
 //   DEVICE_ID           : a unique id for THIS relay — see setup note #2
-const uint8_t MAC_OCT2     = 0x00;
-const uint8_t MAC_OCT3     = 0x00;
-const char*   PASSWORD     = "change_me_or_risk_takeover";
-const uint8_t WCB_QUANTITY = 4;
+const uint8_t MAC_OCT2     = 0x05;
+const uint8_t MAC_OCT3     = 0x4B;
+const char*   PASSWORD     = "khEdzNZNh9rMFP";
+const uint8_t WCB_QUANTITY = 1;
 const uint8_t DEVICE_ID    = 19;
 
 // The NaviCore / out-of-band controller lives at the special-peer id (default 20).

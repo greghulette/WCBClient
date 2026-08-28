@@ -188,6 +188,10 @@ typedef struct __attribute__((packed)) {
 #define WCB_MGMT_MAX_CHUNKS        16    // firmware MGMT_MAX_CHUNKS (uint16 mask)
 #define WCB_MGMT_CHUNK_LEN         179   // payload[180] minus NUL (firmware strncpy)
 #define WCB_MGMT_MAX_COMMAND_LEN   ((size_t)WCB_MGMT_CHUNK_LEN * WCB_MGMT_MAX_CHUNKS)
+#define WCB_MGMT_RX_TIMEOUT_MS     15000UL  // abandon a half-received fragment session after this
+                                            // silence. Matches the WCB firmware reassembly window;
+                                            // a sender needs only ~10 ms/chunk, so anything near this
+                                            // means the peer stopped or went away.
 
 typedef struct __attribute__((packed)) {
     char     structPassword[40];   // network password — must match all peers
@@ -1367,6 +1371,31 @@ private:
     uint16_t      _seqSessionId   = 0;       // session of the frags being reassembled (0 = none yet)
     uint8_t       _seqTotalChunks = 0;
     uint16_t      _seqReceivedMask = 0;      // bit i = chunk i in hand
+    // ── Inbound MGMT-fragment reassembly (see _maybeHandleMgmtFrag) ──────────
+    // send() already fragments a command longer than one packet automatically
+    // (it falls through to _sendFragmented), but until now NOTHING in this
+    // library could put one back together — only the WCB firmware could. That
+    // made oversized traffic one-directional: client -> WCB worked, client ->
+    // client silently delivered nothing. These reassemble it, so send() is
+    // symmetric between any two peers.
+    //
+    // Static, not heap: fragments arrive on the ESP-NOW receive callback, and
+    // allocating there is exactly the class of work this library keeps off that
+    // path. 2.9 KB of BSS buys an allocation-free receive.
+    char          _mgmtBuf[WCB_MGMT_MAX_CHUNKS * WCB_MGMT_CHUNK_LEN + 1] = {0};
+    uint16_t      _mgmtMask       = 0;       // bit i = chunk i received
+    uint16_t      _mgmtSession    = 0xFFFF;  // 0xFFFF = no session in progress
+    uint8_t       _mgmtSender     = 0;
+    uint8_t       _mgmtTotal      = 0;
+    size_t        _mgmtLastLen    = 0;       // payload length of the FINAL chunk
+    unsigned long _mgmtDeadline   = 0;
+    // The sender re-broadcasts every chunk across 2-3 passes, so the complete
+    // set arrives more than once. Remember what we just delivered and drop the
+    // repeats, or one send() would fire the command callback three times.
+    uint16_t      _mgmtDoneSession = 0xFFFF;
+    uint8_t       _mgmtDoneSender  = 0;
+    bool _maybeHandleMgmtFrag(const uint8_t* mac, const uint8_t* data, int len);
+
     char*         _seqChunks      = nullptr; // [WCB_SEQ_MAX_CHUNKS][WCB_SEQ_PAYLOAD_SIZE+1], heap
     unsigned long _seqDeadlineMs  = 0;       // abandon the request at this time
     volatile bool _seqComplete    = false;   // set on the RX task, consumed by update()

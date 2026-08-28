@@ -215,6 +215,13 @@ void WCB_Client::update() {
         _checkMeshChannel();   // catch a SoftAP that moved the radio off the mesh channel
     }
 
+    // Abandon a fragment session whose sender stopped mid-command, so a lost
+    // tail cannot hold the buffer against the next one. Cheap scalar test, and
+    // it runs here on the app task rather than on the receive callback.
+    if (_mgmtSession != 0xFFFF && (long)(now - _mgmtDeadline) >= 0) {
+        _mgmtSession = 0xFFFF; _mgmtMask = 0; _mgmtTotal = 0; _mgmtLastLen = 0;
+    }
+
     _checkOfflineBoards();
     _processMonitors();
     _processFragJob();   // drain a pending fragmented send, one chunk per tick
@@ -2505,6 +2512,94 @@ int WCB_Client::_findFreePending() {
     if (victim >= 0) { _settleSlot(_pending[victim]); _pending[victim].active = false; }
     return victim;   // -1 => every slot is an outstanding ensured delivery
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// _maybeHandleMgmtFrag
+//
+// Reassemble an inbound MGMT fragment session and deliver it as an ordinary
+// command. This is the RECEIVE half of the fragmentation send() has always had:
+// send() falls through to _sendFragmented for anything over
+// _maxSingleCommandLen(), but only the WCB FIRMWARE could rebuild it, so an
+// oversized command from one WCB_Client host to another was transmitted
+// perfectly and then silently dropped. With this, send() is symmetric between
+// any two peers on the mesh.
+//
+// Shape of what arrives (wcb_packet_mgmt_t, 226 B, see WCB_Client.h):
+//   - sent to the BROADCAST MAC with targetWCB addressing, so every host on the
+//     network sees every session and must filter on targetWCB itself;
+//   - there is no sender field in the struct, so the sender is mac[5] — safe
+//     because _handleReceive has already proved octets 0-4 belong to this
+//     network's scheme before we are called;
+//   - chunk i occupies bytes [i*WCB_MGMT_CHUNK_LEN, +len) of the command, and
+//     payload[180] is zero-filled by the sender so a short final chunk is
+//     NUL-terminated;
+//   - every chunk is re-sent across 2-3 passes, so duplicates are NORMAL, not a
+//     fault. The mask dedups them and _mgmtDoneSession stops the completed set
+//     from being delivered again on the following pass.
+//
+// Returns true when the packet was ours to consume (so the raw hook does not
+// also see it), false to let it fall through unchanged.
+bool WCB_Client::_maybeHandleMgmtFrag(const uint8_t* mac, const uint8_t* data, int len) {
+    if (len != (int)sizeof(wcb_packet_mgmt_t)) return false;
+    const wcb_packet_mgmt_t* p = (const wcb_packet_mgmt_t*)data;
+    if (strncmp(p->structPassword, _password, sizeof(p->structPassword) - 1) != 0) return false;
+    if (p->packetType != WCB_MGMT_PACKET_TYPE_FRAG &&
+        p->packetType != WCB_MGMT_PACKET_TYPE_FRAG_UNICAST) return false;
+    if (!_commandCallback) return false;          // nothing to deliver to — leave it alone
+    if (p->targetWCB != _deviceID) return true;   // a session for someone else: consumed, not ours
+
+    // BOUNDS BEFORE INDEXING. totalChunks == 0 would make the completion mask 0
+    // and the session could never finish; an out-of-range chunkIdx would write
+    // past _mgmtBuf. Both are attacker/corruption reachable, so they are checked
+    // before either value is used for arithmetic.
+    if (p->totalChunks == 0 || p->totalChunks > WCB_MGMT_MAX_CHUNKS) return true;
+    if (p->chunkIdx >= p->totalChunks)                                return true;
+
+    const uint8_t sender = mac[5];
+
+    // Already delivered this exact session — this is one of the sender's repeat
+    // passes. Swallow it silently.
+    if (sender == _mgmtDoneSender && p->sessionId == _mgmtDoneSession) return true;
+
+    // A different session (or a different sender) supersedes whatever was in
+    // progress. Last writer wins: holding the old one would only let a peer that
+    // went away block the buffer until the timeout.
+    if (p->sessionId != _mgmtSession || sender != _mgmtSender) {
+        _mgmtSession = p->sessionId;
+        _mgmtSender  = sender;
+        _mgmtTotal   = p->totalChunks;
+        _mgmtMask    = 0;
+        _mgmtLastLen = 0;
+    }
+    // totalChunks disagreeing mid-session means two senders picked the same
+    // random id, or corruption. Restart on the new value rather than mixing.
+    if (p->totalChunks != _mgmtTotal) { _mgmtTotal = p->totalChunks; _mgmtMask = 0; _mgmtLastLen = 0; }
+
+    size_t n = strnlen(p->payload, WCB_MGMT_CHUNK_LEN);
+    memcpy(_mgmtBuf + (size_t)p->chunkIdx * WCB_MGMT_CHUNK_LEN, p->payload, n);
+    if (p->chunkIdx == _mgmtTotal - 1) _mgmtLastLen = n;   // only the LAST chunk may be short
+    _mgmtMask   |= (uint16_t)(1u << p->chunkIdx);
+    _mgmtDeadline = millis() + WCB_MGMT_RX_TIMEOUT_MS;
+
+    const uint16_t full = (uint16_t)((1u << _mgmtTotal) - 1);
+    if (_mgmtMask != full) return true;            // still filling
+
+    // Complete. Length is exact: every chunk but the last is a full
+    // WCB_MGMT_CHUNK_LEN by construction in _sendFragmented.
+    const size_t total = (size_t)(_mgmtTotal - 1) * WCB_MGMT_CHUNK_LEN + _mgmtLastLen;
+    _mgmtBuf[total] = '\0';
+    // Latch "done" BEFORE dispatching: the callback can run for a while and the
+    // sender's next pass is only ~10 ms behind, so the guard has to be armed
+    // first or a repeat could re-enter and deliver twice.
+    _mgmtDoneSender  = sender;
+    _mgmtDoneSession = _mgmtSession;
+    _mgmtSession     = 0xFFFF;
+    _mgmtMask        = 0;
+    _mgmtTotal       = 0;
+    _mgmtDeadline    = 0;
+    _commandCallback(sender, _mgmtBuf);
+    return true;
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // _handleReceive
@@ -2550,6 +2645,11 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
         // so a sketch that never calls requestSequenceNames() sees the raw hook
         // behave exactly as it always has.
         if (_maybeHandleSeqFrag(data, len)) return;
+        // An oversized command someone send()-ed to US, arriving as MGMT
+        // fragments. Rebuilt here and delivered as a normal command, so a
+        // consumer never learns it was split. Checked before the raw hook so a
+        // sketch using both still sees fragments handled, not handed over raw.
+        if (_maybeHandleMgmtFrag(mac, data, len)) return;
         if (_rawPacketCallback) _rawPacketCallback(mac, data, len);
         return;
     }

@@ -735,6 +735,42 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.16.0
+
+**Oversized commands now work in BOTH directions.** `send()` has always
+auto-fragmented anything longer than one packet (it falls through to
+`_sendFragmented`), but nothing in this library could put one back together —
+only the WCB *firmware* could. So client → WCB worked, and client → client
+transmitted perfectly and then delivered nothing at all. Two `WCB_Client` hosts
+talking to each other — a NaviCore and a MgmtRelay, say — had a silent ceiling at
+`_maxSingleCommandLen()`.
+
+Inbound MGMT fragment sessions are now reassembled and handed to the ordinary
+command callback, so a consumer never learns the command was split. Nothing to
+enable and no API change: `send()` is simply symmetric now.
+
+Details that matter if you are debugging it:
+
+- Fragments are **broadcast** with `targetWCB` addressing, so every host sees
+  every session and filters on its own id. The sender is taken from `mac[5]`,
+  which is safe because the receive path has already proved the source MAC
+  belongs to this network's octet scheme.
+- The sender re-broadcasts each chunk over **2–3 passes**, so duplicates are
+  normal. A received-mask dedups them, and a completed session is remembered so
+  the following pass cannot deliver the same command twice.
+- Chunks may arrive **out of order**; a missing one simply withholds delivery
+  until a later pass fills it.
+- `totalChunks` and `chunkIdx` are bounds-checked *before* being used for
+  arithmetic, so a corrupt or hostile header cannot index past the buffer.
+- A half-received session is abandoned after `WCB_MGMT_RX_TIMEOUT_MS` (15 s),
+  swept from `update()` rather than from the receive callback.
+- The reassembly buffer is **static** (~2.9 KB), not heap: fragments arrive on
+  the ESP-NOW receive callback, and allocating there is exactly the work this
+  library keeps off that path.
+- Ceiling is unchanged at `WCB_MGMT_MAX_COMMAND_LEN` (16 × 179 = 2864 bytes).
+- `broadcast()` still refuses oversized input rather than fragmenting — a
+  broadcast has no addressed reassembly session, so it must fail loudly.
+
 ### 1.13.2
 
 - **`MgmtRelay`: an oversized serial line no longer broadcasts its tail to the whole mesh.**
