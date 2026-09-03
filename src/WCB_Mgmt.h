@@ -320,11 +320,23 @@ inline bool handleLine(const char* line) {
     return false;                      // other ?WDP verbs are not ours
   }
   if (detail::iStarts(c, "MGMT,")) {
-    // strdup-free: handleMgmtFrag writes NULs into the buffer, so give it a copy
-    // rather than the caller's string, which may be const or reused.
+    // A copy, because handleMgmtFrag writes NULs into the buffer and the caller's
+    // string may be const or reused.
+    //
+    // REFUSE AN OVERLONG LINE, DO NOT TRUNCATE IT. strncpy would silently cut a
+    // FRAG's payload and we would forward the short version as a complete chunk —
+    // the target reassembles it, writes it, and nothing notices until the config
+    // is wrong. The longest legitimate line here is a FRAG carrying CFG_PAYLOAD
+    // (183) plus its five header fields, so anything approaching this cap is
+    // already malformed. Fail loudly, the way the relay's own reader drops an
+    // oversized line rather than relaying its tail.
     char buf[400];
-    strncpy(buf, c + 5, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    const size_t n = strlen(c + 5);
+    if (n >= sizeof(buf)) {
+      detail::out->printf("[mgmt] line too long (%u B) - dropped\n", (unsigned)n);
+      return true;
+    }
+    memcpy(buf, c + 5, n + 1);
     if      (detail::iStarts(buf, "FRAG,"))     handleMgmtFrag(buf + 5);
     else if (detail::iStarts(buf, "PULL,"))     sendConfigReq((uint8_t)atoi(buf + 5), PT_CONFIG_REQ, 3);
     else if (detail::iStarts(buf, "STATS,"))    sendConfigReq((uint8_t)atoi(buf + 6), PT_STATS_REQ,  1);

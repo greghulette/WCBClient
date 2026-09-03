@@ -1116,7 +1116,13 @@ static void relayWifiCommand(const char* arg) {
     const char* v = arg + 5;                       // past "WIFI,"
 
     if (ieq(v, "DEFAULTS")) {
-        relayPrefs.begin(RELAY_NVS_NS, false);
+        // Checked, like the write path below. clear() on a namespace that failed to
+        // open is a silent no-op, and rebooting while announcing "cleared" would
+        // send someone hunting for why the old settings came back.
+        if (!relayPrefs.begin(RELAY_NVS_NS, false)) {
+            host.println("[relay] could not open NVS - nothing was cleared.");
+            return;
+        }
         relayPrefs.clear();
         relayPrefs.end();
         relayRequestReboot("WiFi settings cleared");
