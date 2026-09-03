@@ -1,11 +1,28 @@
 /*
-  MgmtRelay.ino — turn any ESP32 into a WCB management relay (USB serial ↔ ESP-NOW)
+  MgmtRelay.ino — turn any ESP32 into a WCB management relay
+                  (USB serial and/or WiFi ↔ ESP-NOW)
 
   Flash this to ANY ESP32, plug it into USB, and it becomes a transparent doorway
   into your WCB network. Whatever you (or a host tool like the NaviCore Config
   Tool in "Via WCB" mode) send on USB serial is relayed onto the mesh, and every
   reply from the mesh is printed straight back to USB. That is ALL it does — it
   hosts no servos, audio, LEDs, or PWM; its sole purpose is to be the relay.
+
+  Optionally (RELAY_WIFI_MODE, OFF by default) it carries that exact same line
+  protocol over a WebSocket at ws://<ip>/ws — from its own SoftAP, or by joining an
+  existing one such as NaviCore's — so a phone or desktop app reaches the whole mesh
+  with no USB cable. USB keeps working at the same time: the two are peers, and USB
+  stays the fallback when WiFi is misbehaving.
+
+  ── WHY THIS BOARD CARRIES THE WiFi AND THE WCBs DO NOT ───────────────────────
+  Putting WiFi on every WCB is the obvious idea and the wrong one. The ESP32 has ONE
+  radio: an associated STA follows its AP's channel, so an AP you do not control can
+  move a board off the mesh channel and split the network silently, and a STA that
+  cannot find its AP rescans across every channel, going deaf to the mesh on each
+  sweep. On a WCB that costs real damage too — S3/S4/S5 are bit-banged software
+  UARTs whose TX timing is already sensitive to radio interrupt load. Concentrating
+  WiFi on ONE board that hosts nothing puts all of that where it costs nothing, and
+  gives a host app one address instead of N.
 
   Use it to:
     • Run the NaviCore Config Tool over a spare ESP32 instead of a real WCB —
@@ -24,6 +41,20 @@
                         BROADCAST to every board, exactly like typing a bare
                         command into a WCB's serial port. (A bare JSON line —
                         one starting with '{' — is IGNORED; see the note below.)
+
+  ── Changing the WiFi mode without a reflash ──────────────────────────────────
+    ?RELAY,WIFI                     report the mode, SSID and address
+    ?RELAY,WIFI,OFF                 ESP-NOW only
+    ?RELAY,WIFI,AP[,<pass>]         host our own AP (optionally set its password)
+    ?RELAY,WIFI,JOIN,<ssid>,<pass>  join an existing AP — NaviCore's, typically
+    ?RELAY,WIFI,DEFAULTS            forget NVS, return to the compiled-in values
+
+  The mode and credentials live in NVS, so this survives a reboot and the sketch
+  never has to be edited to move a relay between a bench AP and a droid. Each of
+  these saves and then REBOOTS (after the console goes quiet) — see the note above
+  RELAY_WIFI_MODE for why the change cannot safely be applied to a live radio.
+  Passwords can be set but are never printed back: this console is mirrored to
+  every connected WebSocket client.
 
   ── Using it with the NaviCore Config Tool ────────────────────────────────────
   Just Connect. The tool pings for a DIRECT reply first, gets none through the
@@ -55,6 +86,34 @@
     3. To talk to the NaviCore, the WCBs must have the special peer enabled:
        ?SPECIAL,ON,20  (and the NaviCore must be at that id — 20 by default).
     4. Flash to any ESP32 — no wiring, everything is wireless.
+    5. OPTIONAL, for WiFi access: set RELAY_WIFI_MODE and fill in the credentials
+       in the block below. MESH_CHANNEL must match every WCB (?WCBCH) — one radio
+       means the AP and the mesh share a channel, and a mismatch is a silent
+       blackout, not an error. The AP password is mandatory (>= 8 chars): this
+       WebSocket relays ";w<id>,<cmd>" to every board with no credential of its
+       own, so an open AP would hand the droid to anyone in range.
+
+  ── WebSocket protocol (RELAY_WIFI_MODE != OFF) ───────────────────────────────
+    ADDRESS: with RELAY_STATIC_IP (on by default) this relay is always at
+             192.168.4.<DEVICE_ID> — 192.168.4.19 out of the box — whether it is
+             hosting the AP itself or has joined NaviCore's. The app therefore needs
+             no discovery and does not care which of the two happened. Needs
+             DEVICE_ID >= 13; lower ids fall inside the AP's DHCP pool and the build
+             refuses them rather than letting it fail in the field.
+
+    ws://192.168.4.19/ws
+                   Newline-delimited UTF-8. Lines are EXACTLY what you would type
+                   on the USB port above (";w3,:PP100", or bare text to broadcast),
+                   because both mouths feed the same relaySerialLine(). A line may
+                   span several frames; frames are reassembled per socket.
+    Replies are a CONSOLE MIRROR, not strict request/response: everything the relay
+    would print to USB — command replies, board online/offline, mesh telemetry — is
+    streamed to every connected client.
+
+    This is deliberately the same transport NaviCore exposes (its docs/PROTOCOLS.md;
+    same URI, same framing, same mirror semantics), so a host app writes ONE client
+    and points it at either box. Only the payload grammar differs: NaviCore speaks
+    JSON verbs, this speaks the WCB serial grammar.
 */
 
 #include <WCB_Client.h>
@@ -75,7 +134,7 @@ const uint8_t DEVICE_ID    = 19;
 const uint8_t NAVICORE_ID  = WCB_SPECIAL_ID;   // = 20
 
 // This relay's firmware string, advertised over WDP so it shows up by name.
-const char*   RELAY_FW     = "1.1";
+const char*   RELAY_FW     = "1.2";
 
 // Name this relay advertises (WDP) and reports to the WCB Wizard as its alias.
 const char*   RELAY_ALIAS  = "Mgmt Relay";
@@ -85,7 +144,371 @@ const char*   RELAY_ALIAS  = "Mgmt Relay";
 // non-JSON noise is startup text.
 #define VERBOSE 0
 
+// ── Remote access over WiFi (optional) ─────────────────────────────────────────
+// Gives any host app a WebSocket into the mesh at ws://<ip>/ws carrying
+// the SAME newline-delimited line protocol this sketch's USB port already speaks —
+// deliberately the same transport NaviCore exposes (docs/PROTOCOLS.md), so one
+// client library talks to either box. USB keeps working at the same time: the two
+// are peers, not alternatives, and USB stays the fallback when WiFi misbehaves.
+//
+//   RELAY_WIFI_OFF   ESP-NOW only. The original behaviour, and the default.
+//   RELAY_WIFI_AP    Host our own SoftAP. Self-contained — no infrastructure
+//                    needed, and nothing external can move us off the mesh channel.
+//   RELAY_WIFI_JOIN  Join an existing AP (e.g. NaviCore's) so ONE WiFi network
+//                    reaches both boxes. Falls back to RELAY_WIFI_AP if that AP is
+//                    absent or is not on the mesh channel.
+#define RELAY_WIFI_OFF   0
+#define RELAY_WIFI_AP    1
+#define RELAY_WIFI_JOIN  2
+
+// ── The mode is a RUNTIME setting; this is only its factory default ────────────
+// It used to be compile-time, which meant that moving between hosting an AP and
+// joining NaviCore's took an edit, a rebuild and a reflash — with the board
+// usually already installed in a droid. Now it lives in NVS and is set from the
+// console (USB or the WebSocket, same command surface):
+//
+//   ?RELAY,WIFI                       report the current mode (never a password)
+//   ?RELAY,WIFI,OFF|AP|JOIN           switch mode, then reboot to apply
+//   ?RELAY,WIFI,AP,<pass>             switch to our own AP, setting its password
+//   ?RELAY,WIFI,JOIN,<ssid>,<pass>    switch to joining <ssid>
+//   ?RELAY,WIFI,DEFAULTS              forget NVS and go back to the values below
+//
+// WHY A REBOOT RATHER THAN RECONFIGURING LIVE. The ordering rules above
+// relayStartSoftAP() are not advice: a SoftAP MUST be up BEFORE wcb.begin() and a
+// STA MUST be joined AFTER it, because that begin() inspects WiFi.getMode() and
+// calls WiFi.disconnect() unconditionally. Re-running the dance on a live radio
+// means tearing ESP-NOW down underneath a mesh that is mid-conversation. A reboot
+// re-runs setup() in the one order known to work, costs ~2 s, and cannot leave the
+// radio in a state no code path was written for.
+//
+// The credentials are NVS-backed for the same reason: they were compile-time
+// constants, so changing a password was also a rebuild — and an empty AP_PASS makes
+// the relay refuse to start WiFi at all (deliberately; see AP_PASS below), which is
+// a bad thing to discover after installing the board.
+#define RELAY_WIFI_MODE  RELAY_WIFI_OFF
+
+// Compile the WiFi code in at all. Separate from the mode, because the mode is now
+// chosen at runtime: every path has to be PRESENT in the image for a console
+// command to be able to select it. Set to 0 only to reclaim flash on a build that
+// will never use WiFi — ?RELAY,WIFI then says it was compiled out rather than
+// silently doing nothing.
+#define RELAY_WIFI_BUILD 1
+
+// The ESP-NOW mesh channel. MUST match every WCB (?WCBCH, default 1) and every
+// other client. The ESP32 has ONE radio, so this is also the channel any AP here
+// runs on and the ONLY channel we will accept an association on. That is not a
+// preference: a radio on another channel is a total, silent mesh blackout — every
+// packet dropped, nothing logged on the boards, no fault indication anywhere.
+const uint8_t MESH_CHANNEL = 1;
+
+// Our own SoftAP — used by RELAY_WIFI_AP, and as the RELAY_WIFI_JOIN fallback.
+//
+// THE PASSWORD IS MANDATORY (>= 8 chars) AND WE FAIL CLOSED. This WebSocket is an
+// unauthenticated command channel to every board on the mesh — ";w1,?RESTART" is a
+// bare string with no credential — so an open AP hands the whole droid to anyone in
+// range. WiFi.softAP() with an empty passphrase cheerfully creates an OPEN network,
+// so refusing has to be explicit. Same reasoning, and the same refusal, as NaviCore.
+// These four are FACTORY DEFAULTS. Whatever ?RELAY,WIFI last stored in NVS wins;
+// ?RELAY,WIFI,DEFAULTS forgets NVS and comes back to exactly these.
+const char* AP_SSID = "";                 // "" = derive "MgmtRelay-<DEVICE_ID>"
+const char* AP_PASS = "";                 // REQUIRED — AP will not start without it
+
+// The AP to join in RELAY_WIFI_JOIN mode (NaviCore's SoftAP, typically).
+const char* JOIN_SSID = "";
+const char* JOIN_PASS = "";
+// Retry cadence, and how long to keep trying before giving up and hosting our own AP.
+// The give-up window is generous ON PURPOSE: powered from one switch, this relay is
+// ready long before NaviCore raises its SoftAP (LittleFS mount, config load, ~3.1 MB
+// PSRAM alloc all come first), so a short window would lose that race on every cold
+// boot and strand the app on a fallback AP. Retries cost nothing — see the note above
+// relayJoinService() on why a channel-pinned attempt does not sweep the band.
+const uint32_t JOIN_RETRY_MS  =  5000;    // between attempts
+const uint32_t JOIN_GIVEUP_MS = 90000;    // since boot, then host our own AP
+
+// ── Fixed address ──────────────────────────────────────────────────────────────
+// 1 = take <SUBNET>.DEVICE_ID (e.g. 192.168.4.19) instead of the .1 SoftAP default /
+// a DHCP lease. The point is that the app then knows where this relay lives WITHOUT
+// discovery, and the address is the SAME whether we host the AP or joined NaviCore's.
+//
+// Why this cannot collide with the AP's DHCP pool: the ESP32 core leases exactly
+// eleven addresses starting one above the AP's own IP — start = AP+1, end = start+10
+// (NetworkInterface.cpp:451-453). NaviCore's AP is the default 192.168.4.1, so its
+// pool is 192.168.4.2 - 192.168.4.12. DEVICE_ID 19 sits clear of it.
+//
+// SO KEEP DEVICE_ID >= 13 IF YOU ENABLE THIS. Ids 2-12 land inside that pool and the
+// DHCP server, which knows nothing of our static claim, will eventually hand the same
+// address to a phone. Id 1 is the AP/gateway itself. The default id of 19 is fine;
+// the check below refuses the unsafe ones rather than letting them fail in the field.
+#define RELAY_STATIC_IP  1
+
+// The /24 the AP lives on. 192.168.4.x is the ESP32 SoftAP default, which is what
+// NaviCore uses (it never calls softAPConfig).
+const uint8_t SUBNET_A = 192, SUBNET_B = 168, SUBNET_C = 4;
+
+#if RELAY_STATIC_IP && RELAY_WIFI_MODE != RELAY_WIFI_OFF
+  static_assert(DEVICE_ID >= 13 && DEVICE_ID <= 254,
+                "RELAY_STATIC_IP needs DEVICE_ID >= 13: ids 2-12 fall inside the AP's "
+                "DHCP pool (AP+1 .. AP+11) and id 1 is the AP itself. Raise DEVICE_ID "
+                "or set RELAY_STATIC_IP to 0.");
+#endif
+
+#if RELAY_WIFI_BUILD
+  #include "mgmt_wsserver.h"
+#endif
+
+// ── Host-facing output ─────────────────────────────────────────────────────────
+// Everything the relay says to its host goes through here: USB serial ALWAYS, plus
+// every connected WebSocket client. The handlers stay transport-unaware and keep
+// printing exactly as they always have, so the two mouths cannot drift.
+// Serial.begin/available/read stay direct — this is an OUTPUT tee only.
+class HostOut : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+#if RELAY_WIFI_BUILD
+    mgmtws::sink.write(c);
+#endif
+    return 1;
+  }
+  size_t write(const uint8_t* b, size_t n) override {
+    Serial.write(b, n);
+#if RELAY_WIFI_BUILD
+    mgmtws::sink.write(b, n);
+#endif
+    return n;
+  }
+  using Print::write;
+};
+HostOut host;
+
 WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+
+// ── Deferred reboot ────────────────────────────────────────────────────────────
+// NEVER ESP.restart() FROM A COMMAND HANDLER. A host tool sends commands as a
+// STREAM, so restarting inside one destroys every command still queued behind it —
+// and the sender cannot tell, because the boot banner satisfies its "did the board
+// answer" test, so nothing retries and the batch is scored as fully delivered.
+// That is rule 11 in the WCB firmware, learned there the hard way; this relay feeds
+// the same tools through the same queues and has exactly the same exposure.
+//
+// So set a deadline, let loop() keep draining, and restart only after the console
+// has been QUIET for a moment. Quiet matters on its own: an ACK-paced push empties
+// the queue between every pair of commands, so "the queue is empty" is not the same
+// as "the sender has finished talking".
+static uint32_t relayRebootAtMs = 0;             // 0 = nothing pending
+static const uint32_t REBOOT_QUIET_MS = 1200;
+
+static void relayRequestReboot(const char* why) {
+  host.printf("[relay] %s - rebooting to apply.\n", why);
+  relayRebootAtMs = millis() + REBOOT_QUIET_MS;
+}
+
+// Called whenever a line arrives, to push the reboot out past the rest of a burst.
+static void relayRebootDefer() {
+  if (relayRebootAtMs) relayRebootAtMs = millis() + REBOOT_QUIET_MS;
+}
+
+static void relayRebootService() {
+  if (relayRebootAtMs && (int32_t)(millis() - relayRebootAtMs) >= 0) {
+    Serial.flush();          // the WebSocket sink cannot survive the restart; USB can
+    ESP.restart();
+  }
+}
+
+
+#if RELAY_WIFI_BUILD
+#include <esp_wifi.h>   // esp_wifi_get_channel() — verify where an association left us
+#include <Preferences.h>
+
+// ── Runtime WiFi settings (NVS) ────────────────────────────────────────────────
+// Read ONCE at boot into these, so every later reader sees one consistent snapshot
+// and nothing has to touch NVS on a hot path. ?RELAY,WIFI writes NVS and asks for a
+// reboot; it deliberately does NOT mutate the live values, because half-applied
+// settings are exactly the state the reboot exists to avoid.
+//
+// PASSWORDS ARE WRITE-ONLY FROM THE CONSOLE. They can be set and cleared but never
+// printed back — not in ?RELAY,WIFI, not in the backup, not in a log line. The
+// mesh password already gets that treatment (?EPASS is emitted in the backup but
+// a host app's discovery drops the line), and a WiFi password reaching a
+// console that is itself mirrored to every WebSocket client would be worse: it
+// would travel over the very network it protects.
+static Preferences relayPrefs;
+static const char* RELAY_NVS_NS = "mgmtrelay";
+
+static uint8_t relayWifiMode = RELAY_WIFI_MODE;
+static String  relayApPass   = AP_PASS;
+static String  relayJoinSsid = JOIN_SSID;
+static String  relayJoinPass = JOIN_PASS;
+
+static const char* relayModeName(uint8_t m) {
+  return m == RELAY_WIFI_AP ? "AP" : m == RELAY_WIFI_JOIN ? "JOIN" : "OFF";
+}
+
+static void relayLoadWifiSettings() {
+  if (!relayPrefs.begin(RELAY_NVS_NS, /*readOnly=*/true)) return;   // never written yet
+  relayWifiMode = relayPrefs.getUChar("wifiMode", relayWifiMode);
+  relayApPass   = relayPrefs.getString("apPass",   relayApPass);
+  relayJoinSsid = relayPrefs.getString("joinSsid", relayJoinSsid);
+  relayJoinPass = relayPrefs.getString("joinPass", relayJoinPass);
+  relayPrefs.end();
+  // Anything outside the three known modes is a corrupt or downgraded NVS entry.
+  // Fall back rather than run with a mode no branch handles.
+  if (relayWifiMode > RELAY_WIFI_JOIN) relayWifiMode = RELAY_WIFI_MODE;
+}
+
+// ── WiFi bring-up ──────────────────────────────────────────────────────────────
+// ORDERING IS LOAD-BEARING, AND THE TWO MODES PULL IN OPPOSITE DIRECTIONS:
+//
+//   SoftAP  MUST come up BEFORE wcb.begin(). WCB_Client::begin() reads
+//           WiFi.getMode() on entry and, finding an AP already up, selects
+//           WIFI_AP_STA and KEEPS it rather than forcing WIFI_STA and tearing the
+//           AP down (WCB_Client.cpp:95-112). Raise it afterwards and ESP-NOW has
+//           already pinned the radio.
+//   STA     MUST come up AFTER wcb.begin(). That same begin() calls
+//           WiFi.disconnect() unconditionally (WCB_Client.cpp:103), which drops any
+//           association already made. Join first and it is silently undone.
+//
+// Either way the radio ends on MESH_CHANNEL or the interface does not come up.
+static bool wifiUp = false;
+
+static void relayStartSoftAP() {
+  const size_t pwLen = relayApPass.length();
+  if (pwLen < 8) {
+    host.printf("[relay] WIFI REFUSED: AP password is %u character(s); WPA2 needs 8.\n",
+                (unsigned)pwLen);
+    host.println("[relay] Refusing to start an OPEN access point - this WebSocket relays");
+    host.println("[relay] ;w<id>,<cmd> to every board with no credential of its own.");
+    return;
+  }
+  char ssid[33];
+  if (AP_SSID[0]) strlcpy(ssid, AP_SSID, sizeof(ssid));
+  else            snprintf(ssid, sizeof(ssid), "MgmtRelay-%u", (unsigned)DEVICE_ID);
+#if RELAY_STATIC_IP
+  // Host the AP at <SUBNET>.DEVICE_ID rather than the default .1, so this relay has
+  // the SAME address whether it hosts the AP or joins NaviCore's. See the note on
+  // RELAY_STATIC_IP for why the DHCP pool cannot collide with it.
+  const IPAddress apIp(SUBNET_A, SUBNET_B, SUBNET_C, DEVICE_ID);
+  if (!WiFi.softAPConfig(apIp, apIp, IPAddress(255, 255, 255, 0)))
+    host.printf("[relay] softAPConfig(%s) FAILED - falling back to the default address.\n",
+                apIp.toString().c_str());
+#endif
+  // Channel is softAP()'s 3rd parameter and DEFAULTS TO 1 — pass MESH_CHANNEL
+  // explicitly. Once an AP owns the radio, WCB_Client stops calling
+  // esp_wifi_set_channel and only WARNS on a mismatch (WCB_Client.cpp:121-130), so a
+  // defaulted channel against a mesh on any other channel is a silent, total
+  // blackout: every packet dropped, one log line nobody reads.
+  if (WiFi.softAP(ssid, relayApPass.c_str(), MESH_CHANNEL, /*hidden=*/0, /*max_conn=*/4)) {
+    host.printf("[relay] SoftAP \"%s\" up on channel %u - ws://%s/ws\n",
+                ssid, MESH_CHANNEL, WiFi.softAPIP().toString().c_str());
+    wifiUp = true;
+  } else {
+    host.printf("[relay] SoftAP \"%s\" FAILED to start on channel %u.\n", ssid, MESH_CHANNEL);
+  }
+}
+
+// ── Joining an existing AP ─────────────────────────────────────────────────────
+// ALWAYS COMPILED, run only when relayWifiMode == RELAY_WIFI_JOIN. It used to be
+// #if'd out of an AP-mode build, which is exactly why changing mode needed a
+// reflash — the other mode's code was not in the image to switch to.
+// NON-BLOCKING, RETRIED FROM loop(), AND THAT IS THE WHOLE POINT.
+//
+// On a shared power switch this relay and NaviCore boot together, and the relay wins
+// that race every time: its setup() is a few queues and wcb.begin(), while NaviCore
+// raises its SoftAP only at the END of its own setup — after mounting LittleFS,
+// loading config, and allocating a ~3.1 MB PSRAM record buffer. A one-shot wait in
+// setup() therefore expires against an AP that had simply not appeared yet, and the
+// fallback then leaves TWO APs up with the app on the wrong one. That is worse than
+// no AP at all, and it would be the COMMON case, not the edge case. So we keep
+// retrying for JOIN_GIVEUP_MS with the mesh fully alive throughout, and only host our
+// own AP if the other one genuinely never shows.
+//
+// Two things make an association dangerous to a mesh device. Both are handled here
+// rather than hoped away:
+//
+//   SCANNING  A WiFi.begin() with no channel probes EVERY channel looking for the
+//             SSID, and for the length of each sweep this board is off the mesh.
+//             Passing MESH_CHANNEL confines the probe to the one channel we are
+//             already on, which is what makes retrying cheap enough to do at all;
+//             auto-reconnect stays OFF so a vanished AP cannot start its own sweeps.
+//   CHANNEL   The AP owns the radio channel once associated. NaviCore raises its
+//             SoftAP on its own mesh channel (NaviCore.ino:4647), so joining it is a
+//             no-op channel-wise — but if we ever land somewhere else we hang up
+//             rather than sit silently off-mesh.
+static uint32_t joinNextAttemptMs = 0;
+static uint8_t  joinAttempts      = 0;
+static bool     joinSettled       = false;   // joined, or gave up and raised our own AP
+
+static void relayJoinAttempt() {
+  WiFi.setAutoReconnect(false);
+#if RELAY_STATIC_IP
+  // Ask for <SUBNET>.DEVICE_ID instead of taking whatever DHCP offers, so the app
+  // always knows where to find us. Safe against the AP's DHCP pool — see the note on
+  // RELAY_STATIC_IP. Gateway/DNS are the AP itself at .1.
+  const IPAddress me(SUBNET_A, SUBNET_B, SUBNET_C, DEVICE_ID);
+  const IPAddress gw(SUBNET_A, SUBNET_B, SUBNET_C, 1);
+  if (!WiFi.config(me, gw, IPAddress(255, 255, 255, 0), gw))
+    host.println("[relay] static IP config FAILED - falling back to DHCP.");
+#endif
+  WiFi.begin(relayJoinSsid.c_str(), relayJoinPass.c_str(), MESH_CHANNEL);
+  joinAttempts++;
+}
+
+// Serviced every loop() pass until it settles. Never blocks.
+static void relayJoinService() {
+  if (joinSettled) return;
+  const uint32_t now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // Verify where the association actually left the radio. WCB_Client::update() also
+    // notices a drift and warns every 30 s (WCB_Client.cpp:215, :1549) — but it only
+    // WARNS, and a relay that cannot reach the mesh is useless. Act on it.
+    uint8_t primary = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&primary, &second);
+    if (primary != MESH_CHANNEL) {
+      host.printf("[relay] joined \"%s\" but the radio is on channel %u, not %u - "
+                  "that is off-mesh. Disconnecting.\n", relayJoinSsid.c_str(), primary, MESH_CHANNEL);
+      WiFi.disconnect(true);
+      joinSettled = true;
+      relayStartSoftAP();
+      return;
+    }
+    host.printf("[relay] joined \"%s\" on channel %u after %u attempt(s) - ws://%s/ws\n",
+                relayJoinSsid.c_str(), primary, joinAttempts, WiFi.localIP().toString().c_str());
+    wifiUp      = true;
+    joinSettled = true;
+    return;
+  }
+
+  if (now < joinNextAttemptMs) return;
+
+  if (now >= JOIN_GIVEUP_MS) {
+    host.printf("[relay] \"%s\" did not appear within %lu s (%u attempts) - "
+                "hosting our own SoftAP instead.\n",
+                relayJoinSsid.c_str(), (unsigned long)(JOIN_GIVEUP_MS / 1000), joinAttempts);
+    WiFi.disconnect(true);
+    joinSettled = true;
+    relayStartSoftAP();
+    return;
+  }
+
+  relayJoinAttempt();
+  joinNextAttemptMs = now + JOIN_RETRY_MS;
+}
+
+// Bring the WebSocket up the moment an interface exists, whichever way it arrived.
+// Started from loop(), not setup(), because in JOIN mode the interface may not be up
+// until well after setup() has returned.
+static bool wsStarted = false;
+
+static void relayWifiService() {
+  if (relayWifiMode == RELAY_WIFI_JOIN) relayJoinService();
+  if (wifiUp && !wsStarted) {
+    wsStarted = mgmtws::begin();
+    if (wsStarted) host.println("[relay] WebSocket up at /ws - same line protocol as this port.");
+  }
+}
+#endif  // RELAY_WIFI_BUILD
 
 // Inbound mesh lines are queued here on the receive callback and PRINTED from
 // loop() (Core 1) — never printed straight from onMeshData. That callback runs on
@@ -251,7 +674,7 @@ void onMeshData(uint8_t senderID, const char* command) {
 void onMeshStatus(uint8_t wcbID, bool online) {
     (void)wcbID; (void)online;
 #if VERBOSE
-    Serial.printf("[relay] %s%d %s\n",
+    host.printf("[relay] %s%d %s\n",
                   wcbID == NAVICORE_ID ? "NaviCore/id" : "WCB",
                   wcbID, online ? "online" : "offline");
 #endif
@@ -316,29 +739,29 @@ static void wdpScrub(char* s) {
 // only requires the "WCB Configuration Backup" header + an "End of Backup" line to
 // accept the device; the ?TOKEN lines identify this relay's slot (id/MAC/quantity).
 void wcbPrintBackup() {
-    Serial.println();
-    Serial.println("*** ========================================");
-    Serial.println("*** WCB Configuration Backup");
-    Serial.println("*** Copy and paste these commands to restore");
-    Serial.println("*** ========================================");
-    Serial.println();
-    Serial.println("?HW,32");
-    Serial.printf ("?MAC,2,%02X\n", MAC_OCT2);
-    Serial.printf ("?MAC,3,%02X\n", MAC_OCT3);
-    Serial.printf ("?WCB,%d\n",     DEVICE_ID);
-    Serial.println("?RELAY,1");     // marks this device a management relay → dedicated Wizard card
-    Serial.printf ("?ALIAS,%s\n",   RELAY_ALIAS);
-    Serial.printf ("?WCBQ,%d\n",    WCB_QUANTITY);
-    Serial.printf ("?EPASS,%s\n",   PASSWORD);
-    Serial.println("?CMDCHAR,;");
-    Serial.println("--------- End of Backup ---------");
-    Serial.println();
+    host.println();
+    host.println("*** ========================================");
+    host.println("*** WCB Configuration Backup");
+    host.println("*** Copy and paste these commands to restore");
+    host.println("*** ========================================");
+    host.println();
+    host.println("?HW,32");
+    host.printf ("?MAC,2,%02X\n", MAC_OCT2);
+    host.printf ("?MAC,3,%02X\n", MAC_OCT3);
+    host.printf ("?WCB,%d\n",     DEVICE_ID);
+    host.println("?RELAY,1");     // marks this device a management relay → dedicated Wizard card
+    host.printf ("?ALIAS,%s\n",   RELAY_ALIAS);
+    host.printf ("?WCBQ,%d\n",    WCB_QUANTITY);
+    host.printf ("?EPASS,%s\n",   PASSWORD);
+    host.println("?CMDCHAR,;");
+    host.println("--------- End of Backup ---------");
+    host.println();
 }
 
 // ?version → the Wizard reads "Software Version: X", terminated by "End of Version".
 void wcbPrintVersion() {
-    Serial.printf("Software Version: %s\n", RELAY_FW);
-    Serial.println("End of Version");
+    host.printf("Software Version: %s\n", RELAY_FW);
+    host.println("End of Version");
 }
 
 // ?WDP,DUMP → the mesh inventory the Wizard's discovery panel shows. Built from this
@@ -348,7 +771,7 @@ void wcbPrintVersion() {
 void wcbPrintWdpDump() {
     unsigned long now = millis();
     // SELF row (this relay). CLIENT=0 → shown as the tethered board; PEER=3 = "this board".
-    Serial.printf("[WDP:N=%d,CLIENT=0,ALIAS=%s,HW=32,HWREV=,FW=%s,CAP=0000,CTRL=0,CAPTAGS=,MAESTRO=-,AGE=0,SEEN=1,PEER=3]\n",
+    host.printf("[WDP:N=%d,CLIENT=0,ALIAS=%s,HW=32,HWREV=,FW=%s,CAP=0000,CTRL=0,CAPTAGS=,MAESTRO=-,AGE=0,SEEN=1,PEER=3]\n",
                   DEVICE_ID, RELAY_ALIAS, RELAY_FW);
     int count = 0, peers = 0;
     for (uint8_t id = 1; id <= WCB_MAX_BOARDS; id++) {
@@ -368,17 +791,17 @@ void wcbPrintWdpDump() {
                 o += snprintf(maestro + o, sizeof(maestro) - o, "%s%d", m ? "." : "", nb->maestroIds[m]);
         }
         int peerFlag = wcb.isLearnedPeer(id) ? 2 : (id <= WCB_QUANTITY ? 1 : 0);
-        Serial.printf("[WDP:N=%d,CLIENT=%d,ALIAS=%s,HW=%d,HWREV=%s,FW=%s,CAP=%04X,CTRL=%d,CAPTAGS=%s,MAESTRO=%s,AGE=%lu,SEEN=1,PEER=%d]\n",
+        host.printf("[WDP:N=%d,CLIENT=%d,ALIAS=%s,HW=%d,HWREV=%s,FW=%s,CAP=%04X,CTRL=%d,CAPTAGS=%s,MAESTRO=%s,AGE=%lu,SEEN=1,PEER=%d]\n",
                       id, nb->isClient ? 1 : 0, alias, nb->hwVer, hwrev, fw, (unsigned)nb->capFlags,
                       nb->ctrlId, captags, maestro, (now - nb->lastSeenMs) / 1000UL, peerFlag);
         for (int p = 0; p < 5; p++) {
             if (!nb->portLabels[p][0]) continue;
             char lbl[25]; strncpy(lbl, nb->portLabels[p], sizeof(lbl)); lbl[sizeof(lbl)-1] = '\0'; wdpScrub(lbl);
-            Serial.printf("[WDPIF:N=%d,S=%d,DEV=%s]\n", id, p + 1, lbl);
+            host.printf("[WDPIF:N=%d,S=%d,DEV=%s]\n", id, p + 1, lbl);
         }
     }
-    Serial.printf("[WDPCFG:EN=1,AUTOJOIN=%d,PEERS=%d]\n", wcb.autoJoinEnabled() ? 1 : 0, peers);
-    Serial.printf("[WDP:END,count=%d]\n", count);
+    host.printf("[WDPCFG:EN=1,AUTOJOIN=%d,PEERS=%d]\n", wcb.autoJoinEnabled() ? 1 : 0, peers);
+    host.printf("[WDP:END,count=%d]\n", count);
 }
 
 // Forward a Wizard "?MGMT,FRAG,..." line to the target board (Phase 2a).
@@ -405,7 +828,7 @@ void handleMgmtFrag(char* frag) {
     String marked = String("\x01") + payload;
     wcb.send(target, marked.c_str(), true);          // ensured (ETM + CRC); auto-frags if long
 #if VERBOSE
-    Serial.printf("[relay] MGMT -> WCB%d (1/1): %s\n", target, payload);
+    host.printf("[relay] MGMT -> WCB%d (1/1): %s\n", target, payload);
 #endif
     return;
   }
@@ -427,7 +850,7 @@ void handleMgmtFrag(char* frag) {
   pkt.payload[sizeof(pkt.payload) - 1] = '\0';
   wcb.sendRawPacket(target, (const uint8_t*)&pkt, sizeof(pkt));
 #if VERBOSE
-  Serial.printf("[relay] MGMT -> WCB%d frag %u/%u (session %04X)\n", target, idx + 1, total, sid);
+  host.printf("[relay] MGMT -> WCB%d frag %u/%u (session %04X)\n", target, idx + 1, total, sid);
 #endif
 }
 
@@ -498,7 +921,7 @@ void processConfigFrag(const uint8_t* data) {
     uint8_t src = fragReasm.sourceWCB;
     lastDeliveredSession = pkt.sessionId;
     memset(&fragReasm, 0, sizeof(fragReasm));
-    Serial.printf("[MGMT:%s,%d]%s\n", tag, src, full.c_str());
+    host.printf("[MGMT:%s,%d]%s\n", tag, src, full.c_str());
   }
 }
 
@@ -517,7 +940,7 @@ void processRemoteTerm(const uint8_t* data) {
   while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) len--;
   if (len == 0) return;                                            // blank line: firmware prints nothing (line 171)
   line[len] = '\0';
-  Serial.printf("[TERM:%d]%s\n", pkt.sourceWCB, line);
+  host.printf("[TERM:%d]%s\n", pkt.sourceWCB, line);
 }
 
 // CRC-32 (reflected, poly 0xEDB88320) — byte-for-byte the same function as
@@ -554,7 +977,7 @@ void relayOtaCommand(const char* argsC) {
   uint16_t session = (uint16_t)((c3 < 0 ? r2 : r2.substring(0, c3)).toInt());
   String   r3      = (c3 < 0) ? "" : r2.substring(c3 + 1);
 
-  if (target < 1 || target > WCB_MAX_BOARDS) { Serial.printf("[OTA] relay: invalid target %u\n", target); return; }
+  if (target < 1 || target > WCB_MAX_BOARDS) { host.printf("[OTA] relay: invalid target %u\n", target); return; }
 
   // Send and SAY SO IF IT FAILED. sendRawPacket() returns false when the target
   // could not be registered as an ESP-NOW peer — the usual cause being a full
@@ -566,7 +989,7 @@ void relayOtaCommand(const char* argsC) {
   // firmware surfaces the same failure on its own leg (WCB_OTA.cpp otaUnicast).
   auto otaSend = [&](const void* p, size_t n, const char* label) {
     if (wcb.sendRawPacket(target, (const uint8_t*)p, n)) return;
-    Serial.printf("[OTA] relay %s -> WCB%u FAILED to send — could not register the "
+    host.printf("[OTA] relay %s -> WCB%u FAILED to send — could not register the "
                   "peer (ESP-NOW table full? cap ~20; ?WDP,DUMP reports PEERS=n)\n",
                   label, target);
   };
@@ -585,7 +1008,7 @@ void relayOtaCommand(const char* argsC) {
 
   if (sub == "DATA") {
     int p = r3.indexOf(',');
-    if (p < 0) { Serial.println("[OTA] relay DATA usage: ?OTA,DATA,<t>,<s>,<offset>[:<crc32>],<b64>"); return; }
+    if (p < 0) { host.println("[OTA] relay DATA usage: ?OTA,DATA,<t>,<s>,<offset>[:<crc32>],<b64>"); return; }
     String offField = r3.substring(0, p);
     String   b64    = r3.substring(p + 1); b64.trim();
     // Optional integrity suffix on the OFFSET field: "<offset>:<crc32hex>" over
@@ -604,7 +1027,7 @@ void relayOtaCommand(const char* argsC) {
       const uint32_t want = (uint32_t)strtoul(crcHex.c_str(), nullptr, 16);
       const uint32_t have = relayCrc32(offField + "," + b64);
       if (want != have) {
-        Serial.printf("[OTA] relay DATA @%lu DROPPED: crc %08X != %08X (b64 %u chars)\n",
+        host.printf("[OTA] relay DATA @%lu DROPPED: crc %08X != %08X (b64 %u chars)\n",
                       (unsigned long)offset, (unsigned)have, (unsigned)want, (unsigned)b64.length());
         return;   // target cursor stalls -> sender rewinds and resends
       }
@@ -616,7 +1039,7 @@ void relayOtaCommand(const char* argsC) {
     size_t outLen = 0;
     int rc = mbedtls_base64_decode(pkt.data, sizeof(pkt.data), &outLen,
                                    (const unsigned char*)b64.c_str(), b64.length());
-    if (rc != 0) { Serial.printf("[OTA] relay DATA base64 error %d\n", rc); return; }
+    if (rc != 0) { host.printf("[OTA] relay DATA base64 error %d\n", rc); return; }
     pkt.dataLen = (uint16_t)outLen;
     otaSend(&pkt, sizeof(pkt), "DATA");
     return;
@@ -631,7 +1054,7 @@ void relayOtaCommand(const char* argsC) {
     return;
   }
 
-  Serial.printf("[OTA] relay: unknown subcommand '%s'\n", sub.c_str());
+  host.printf("[OTA] relay: unknown subcommand '%s'\n", sub.c_str());
 }
 
 // loop(): a target's 55-byte OTA_ACK → [OTA:ACK,<src>,<session>,<offset>,<status>] on USB,
@@ -643,8 +1066,117 @@ void processOtaAck(const uint8_t* data) {
   if (strcmp(pkt.structPassword, PASSWORD) != 0) return;
   if (pkt.packetType != PT_OTA_ACK) return;          // BEGIN/END/ABORT are ours→target; ignore any echo
   if (pkt.targetWCB  != DEVICE_ID)  return;           // this ACK is addressed to us (the relay)
-  Serial.printf("[OTA:ACK,%u,%u,%lu,%u]\n",
+  host.printf("[OTA:ACK,%u,%u,%lu,%u]\n",
                 pkt.sourceWCB, pkt.sessionId, (unsigned long)pkt.ackedOffset, pkt.status);
+}
+
+// ── ?RELAY,WIFI — read and change the WiFi mode without a reflash ─────────────
+//   ?RELAY,WIFI                     report mode / SSID / address
+//   ?RELAY,WIFI,OFF                 ESP-NOW only
+//   ?RELAY,WIFI,AP[,<pass>]         host our own AP (optionally set its password)
+//   ?RELAY,WIFI,JOIN,<ssid>,<pass>  join an existing AP (NaviCore's, typically)
+//   ?RELAY,WIFI,DEFAULTS            forget NVS, return to the compiled-in values
+//
+// A PASSWORD IS THE LAST FIELD AND IS TAKEN VERBATIM, commas and all. WPA2 allows
+// them and splitting on every comma would silently truncate such a password to its
+// first field — which fails as "wrong password" against an AP that is working fine.
+//
+// Nothing here is echoed back. See the note on relayApPass: this console is
+// mirrored to every connected WebSocket client, so printing a password would send
+// it over the network it exists to protect.
+static void relayWifiCommand(const char* arg) {
+#if !RELAY_WIFI_BUILD
+    (void)arg;
+    host.println("[relay] WiFi was compiled out of this build (RELAY_WIFI_BUILD 0).");
+#else
+    // Bare "?RELAY" or "?RELAY,WIFI" → report.
+    if (!arg[0] || ieq(arg, "WIFI")) {
+        host.printf("[relay] WiFi mode: %s%s\n", relayModeName(relayWifiMode),
+                    relayWifiMode == RELAY_WIFI_OFF ? "" :
+                    (wifiUp ? " (up)" : " (not up yet)"));
+        if (relayWifiMode == RELAY_WIFI_JOIN)
+            host.printf("[relay]   joining: \"%s\"%s\n",
+                        relayJoinSsid.length() ? relayJoinSsid.c_str() : "(unset)",
+                        relayJoinPass.length() ? "" : "  (no password set)");
+        if (relayWifiMode == RELAY_WIFI_AP)
+            host.printf("[relay]   password: %s\n",
+                        relayApPass.length() >= 8 ? "set" : "NOT SET - the AP will refuse to start");
+        if (wifiUp)
+            host.printf("[relay]   ws://%s/ws on channel %u\n",
+                        (relayWifiMode == RELAY_WIFI_JOIN && WiFi.status() == WL_CONNECTED
+                           ? WiFi.localIP() : WiFi.softAPIP()).toString().c_str(),
+                        MESH_CHANNEL);
+        host.println("[relay]   ?RELAY,WIFI,OFF | AP[,<pass>] | JOIN,<ssid>,<pass> | DEFAULTS");
+        return;
+    }
+    if (!iStarts(arg, "WIFI,")) {
+        host.printf("[relay] unknown ?RELAY command \"%s\" - try ?RELAY,WIFI\n", arg);
+        return;
+    }
+    const char* v = arg + 5;                       // past "WIFI,"
+
+    if (ieq(v, "DEFAULTS")) {
+        relayPrefs.begin(RELAY_NVS_NS, false);
+        relayPrefs.clear();
+        relayPrefs.end();
+        relayRequestReboot("WiFi settings cleared");
+        return;
+    }
+
+    uint8_t mode;
+    String  ssid, pass;
+    if (ieq(v, "OFF")) {
+        mode = RELAY_WIFI_OFF;
+    } else if (ieq(v, "AP") || iStarts(v, "AP,")) {
+        mode = RELAY_WIFI_AP;
+        if (v[2] == ',') pass = v + 3;             // rest of the line, commas included
+        else             pass = relayApPass;       // keep whatever is stored
+        if (pass.length() < 8) {
+            host.printf("[relay] REFUSED: an AP password needs 8+ characters (got %u).\n",
+                        (unsigned)pass.length());
+            host.println("[relay] This WebSocket relays ;w<id>,<cmd> to every board with no");
+            host.println("[relay] credential of its own - an open AP hands over the droid.");
+            return;
+        }
+    } else if (iStarts(v, "JOIN,")) {
+        mode = RELAY_WIFI_JOIN;
+        const char* s = v + 5;
+        const char* comma = strchr(s, ',');
+        if (!comma) {
+            host.println("[relay] usage: ?RELAY,WIFI,JOIN,<ssid>,<password>");
+            return;
+        }
+        ssid = String(s).substring(0, comma - s);
+        pass = comma + 1;                          // verbatim: a password may contain commas
+        if (!ssid.length()) {
+            host.println("[relay] REFUSED: the SSID to join cannot be empty.");
+            return;
+        }
+    } else {
+        host.printf("[relay] unknown WiFi mode \"%s\" - use OFF, AP or JOIN.\n", v);
+        return;
+    }
+
+    // Write, then reboot. Deliberately NOT applied to the live variables: the
+    // ordering rules above relayStartSoftAP() mean a mode only makes sense when
+    // setup() runs it in the right order relative to wcb.begin(), and a half-applied
+    // pair (new mode, old radio) is the state the reboot exists to avoid.
+    if (!relayPrefs.begin(RELAY_NVS_NS, false)) {
+        host.println("[relay] could not open NVS - setting NOT saved.");
+        return;
+    }
+    relayPrefs.putUChar("wifiMode", mode);
+    if (mode == RELAY_WIFI_AP)   relayPrefs.putString("apPass", pass);
+    if (mode == RELAY_WIFI_JOIN) { relayPrefs.putString("joinSsid", ssid);
+                                   relayPrefs.putString("joinPass", pass); }
+    relayPrefs.end();
+
+    if (mode == RELAY_WIFI_JOIN)
+        host.printf("[relay] WiFi mode -> JOIN \"%s\"\n", ssid.c_str());
+    else
+        host.printf("[relay] WiFi mode -> %s\n", relayModeName(mode));
+    relayRequestReboot("WiFi settings saved");
+#endif
 }
 
 // ── Serial → mesh: parse one line and relay it ────────────────────────────────
@@ -653,6 +1185,8 @@ void processOtaAck(const uint8_t* data) {
 //   <no ';' prefix>                 → broadcast to the whole mesh
 // The `line` buffer is modified in place (temporary NUL terminators).
 void relaySerialLine(char* line) {
+    // A pending reboot waits out the rest of whatever burst this line belongs to.
+    relayRebootDefer();
     // ── WCB Wizard: answer its local (?) queries so it accepts this relay and can
     // drive the mesh through it. These coexist with the NaviCore tool's ;w / JSON.
     if (!strcmp(line, "WCB_WEBTOOL_CONFIG_PULL")) { wcbPrintBackup(); return; }
@@ -660,6 +1194,10 @@ void relaySerialLine(char* line) {
         const char* c = line + 1;                // command after the '?' funcChar
         if (ieq(c, "backup"))  { wcbPrintBackup();  return; }
         if (ieq(c, "version")) { wcbPrintVersion(); return; }
+        if (iStarts(c, "RELAY,") || ieq(c, "RELAY")) {
+            relayWifiCommand(ieq(c, "RELAY") ? "" : c + 6);
+            return;
+        }
         if (iStarts(c, "WDP,")) {
             if (ieq(c + 4, "DUMP")) wcbPrintWdpDump();
             // ?WDP,AUTOJOIN / FORGET / CLEAR — a later phase.
@@ -694,7 +1232,7 @@ void relaySerialLine(char* line) {
         // Plain text → broadcast to all boards (like a bare line on a WCB).
         wcb.broadcast(line);
 #if VERBOSE
-        Serial.printf("[relay] broadcast: %s\n", line);
+        host.printf("[relay] broadcast: %s\n", line);
 #endif
         return;
     }
@@ -702,13 +1240,13 @@ void relaySerialLine(char* line) {
     // Only the ;w relay verb is handled — this device is a relay, not a full WCB.
     char verb = line[1];
     if (verb != 'w' && verb != 'W') {
-        Serial.printf("[relay] unsupported ;%c command — this relay only handles ;w<id>,<cmd>\n",
+        host.printf("[relay] unsupported ;%c command — this relay only handles ;w<id>,<cmd>\n",
                       verb ? verb : '?');
         return;
     }
 
     char* p = line + 2;                      // first char after ";w"
-    if (*p == '\0') { Serial.println("[relay] usage: ;w<id>,<command>"); return; }
+    if (*p == '\0') { host.println("[relay] usage: ;w<id>,<command>"); return; }
 
     uint8_t     target  = 0;
     const char* payload = nullptr;
@@ -726,22 +1264,22 @@ void relaySerialLine(char* line) {
         }
     } else {                                 // ;w<alias>,<cmd>
         char* comma = strchr(p, ',');
-        if (!comma) { Serial.println("[relay] usage: ;w<alias>,<command>"); return; }
+        if (!comma) { host.println("[relay] usage: ;w<alias>,<command>"); return; }
         *comma  = '\0';
         target  = idForAlias(p);
         payload = comma + 1;
-        if (!target) { Serial.printf("[relay] no board known as \"%s\"\n", p); return; }
+        if (!target) { host.printf("[relay] no board known as \"%s\"\n", p); return; }
     }
 
     if (target < 1 || target > WCB_MAX_BOARDS) {
-        Serial.printf("[relay] bad target id %d (use 1-%d, or %d for NaviCore)\n",
+        host.printf("[relay] bad target id %d (use 1-%d, or %d for NaviCore)\n",
                       target, WCB_MAX_BOARDS, NAVICORE_ID);
         return;
     }
 
     wcb.send(target, payload);               // ensured (ETM + CRC); auto-fragments if long
 #if VERBOSE
-    Serial.printf("[relay] -> WCB%d: %s\n", target, payload);
+    host.printf("[relay] -> WCB%d: %s\n", target, payload);
 #endif
 }
 
@@ -767,10 +1305,25 @@ void setup() {
     wcb.onStatusChange(onMeshStatus);
     wcb.onRawPacket(onMeshRaw);                          // Phase 2b: raw reply/terminal packets
 
+#if RELAY_WIFI_BUILD
+    // BEFORE the mode is used for anything: the stored mode and credentials decide
+    // both branches below, and reading NVS here means one snapshot serves the whole
+    // boot rather than each site re-reading and possibly disagreeing.
+    relayLoadWifiSettings();
+    if (relayWifiMode == RELAY_WIFI_AP) {
+        // BEFORE wcb.begin() — see the ordering note above relayStartSoftAP().
+        relayStartSoftAP();
+    }
+#endif
+    // Pin the expected mesh channel before begin(). With no AP up, WCB_Client sets
+    // the radio to it; with our AP already up, the AP owns the channel and this is
+    // what update() compares against to catch a drift.
+    wcb.setMeshChannel(MESH_CHANNEL);
+
     // Join the WCB network. false = ESP-NOW did not start; halt rather than run
     // update()/send against an uninitialised driver (which would crash).
     if (!wcb.begin()) {
-        Serial.println("[relay] begin() FAILED (see error above) — halting.");
+        host.println("[relay] begin() FAILED (see error above) — halting.");
         while (true) delay(1000);
     }
 
@@ -784,18 +1337,41 @@ void setup() {
     wcb.setTemporary(true);
     wcb.setIdentity(RELAY_ALIAS, RELAY_FW);
 
+#if RELAY_WIFI_BUILD
+    if (relayWifiMode == RELAY_WIFI_JOIN) {
+    // AFTER wcb.begin() — begin() calls WiFi.disconnect() and would undo the join.
+    // Only KICKS OFF the first attempt; relayJoinService() in loop() carries it from
+    // here, so a NaviCore that is still booting costs us no blocked time at all. If
+    // it never appears we host our own AP instead — raising it late is safe because
+    // it goes up on MESH_CHANNEL, and the conflict that ordering normally causes is a
+    // CHANNEL conflict, which softAP() on the pinned channel cannot create.
+    if (!relayJoinSsid.length()) {
+        host.println("[relay] JOIN mode selected but no SSID is set - hosting our own AP.");
+        host.println("[relay]   set one with: ?RELAY,WIFI,JOIN,<ssid>,<pass>");
+        joinSettled = true;
+        relayStartSoftAP();
+    } else {
+        host.printf("[relay] looking for \"%s\" on channel %u (up to %lu s, then our own AP)\n",
+                    relayJoinSsid.c_str(), MESH_CHANNEL,
+                    (unsigned long)(JOIN_GIVEUP_MS / 1000));
+        relayJoinAttempt();
+        joinNextAttemptMs = millis() + JOIN_RETRY_MS;
+    }
+    }
+#endif
+
     // Boot lines the WCB Wizard's sniffer reads to learn this device's command
     // chars (funcChar '?', cmdChar ';') + version. Also satisfies the Wizard's
     // auto-detect, which triggers on ANY bytes emitted after reset.
-    Serial.println("Delimeter Character: ^");
-    Serial.println("Local Function Identifier: ?");
-    Serial.println("Command Character: ;");
-    Serial.printf ("Software Version: %s\n", RELAY_FW);
+    host.println("Delimeter Character: ^");
+    host.println("Local Function Identifier: ?");
+    host.println("Command Character: ;");
+    host.printf ("Software Version: %s\n", RELAY_FW);
 
-    Serial.println("[relay] WCB management relay ready.");
-    Serial.println("[relay]   ;w<id>,<cmd>    relay to WCB <id> (20 = NaviCore)");
-    Serial.println("[relay]   ;w<alias>,<cmd> relay by advertised name");
-    Serial.println("[relay]   <text>          broadcast to all boards");
+    host.println("[relay] WCB management relay ready.");
+    host.println("[relay]   ;w<id>,<cmd>    relay to WCB <id> (20 = NaviCore)");
+    host.println("[relay]   ;w<alias>,<cmd> relay by advertised name");
+    host.println("[relay]   <text>          broadcast to all boards");
 }
 
 // 384 B: a relay OTA "?OTA,DATA,<t>,<s>,<offset>,<base64>" line is the longest
@@ -821,7 +1397,7 @@ void loop() {
     // fragments, rc_hb) from being corrupted by a cross-core write race.
     RelayLine out;
     while (relayOutQueue && xQueueReceive(relayOutQueue, &out, 0) == pdTRUE)
-        Serial.println(out.buf);
+        host.println(out.buf);
 
     // Decode raw config/stats/etm/terminal packets queued by onMeshRaw (Phase 2b).
     RawPkt rp;
@@ -848,7 +1424,23 @@ void loop() {
         } else {
             inOverrun = true;                 // overrun — swallow to end-of-line
             inLen     = 0;
-            Serial.println("[relay] line too long — dropped (use the Config Tool for big configs)");
+            host.println("[relay] line too long — dropped (use the Config Tool for big configs)");
         }
     }
+
+#if RELAY_WIFI_BUILD
+    // Carry a pending join forward (JOIN mode) and start the WebSocket once an
+    // interface exists. Non-blocking: the mesh keeps running the whole time.
+    relayWifiService();
+    // Run at most ONE queued WebSocket command per pass, on THIS task — the httpd
+    // handler that received it runs on Core 0 beside the ESP-NOW callback and may
+    // only copy-enqueue-return (see mgmt_wsserver.h). Then flush host output to the
+    // sockets at this one known point, never from inside a print.
+    mgmtws::drain();
+    mgmtws::pump();
+#endif
+
+    // LAST, and after the pump above, so the "rebooting to apply" line has actually
+    // reached the WebSocket clients before the socket dies with the restart.
+    relayRebootService();
 }
