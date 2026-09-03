@@ -728,12 +728,148 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 | `SpecialPeer` | Talk to the out-of-band controller (e.g. NaviCore) at id 20 |
 | `NeighborDiscovery` | Learn the mesh over WDP — who's out there and what they can do |
 | `DeliveryStats` | Per-peer delivery counters, with a guided two-board bench procedure that proves each one |
-| `MgmtRelay` | Turn any ESP32 into a USB-serial ↔ ESP-NOW management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port |
+| `MgmtRelay` | Turn any ESP32 into a management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port, and optionally over a WebSocket from its own SoftAP or NaviCore's  |
 | `AllFeatures` | Interactive "kitchen sink" — every public method in one sketch, including a `t` key that dumps per-peer delivery statistics and `z` to reset them |
 
 ---
 
 ## Changelog
+
+### 1.17.0
+
+**`WCB_Mgmt.h` — the WCB Wizard's management surface, usable by any `WCB_Client` host.**
+Previously it lived inside `examples/MgmtRelay`, so only that sketch could be the Wizard's
+doorway into the mesh. It is now a library module, and a host enables it with four calls:
+
+```cpp
+WcbMgmt::begin(&wcb, &Serial, identity);   // once, in setup()
+WcbMgmt::handleLine(line)                  // from your "?" dispatcher — true = consumed
+WcbMgmt::onRawPacket(data, len)            // from your raw-packet hook — true = consumed
+WcbMgmt::service();                        // from loop()
+```
+
+That covers `WCB_WEBTOOL_CONFIG_PULL` / `?backup`, `?version`, `?WDP,DUMP`, and
+`?MGMT,FRAG|PULL|STATS|ETM,CHAR`, plus reassembly of the replies into `[MGMT:CONFIG|STATS|
+ETM,<src>]` and `[TERM:<src>]` lines. `Identity.advertiseRelay` emits `?RELAY,1`, which makes
+the Wizard file the device as a dedicated **relay card** rather than a configurable board.
+
+**Why a module and not a copy.** This is a wire protocol with three parties — the Wizard, the
+relaying device, and the WCB firmware. Every struct is byte-matched to `WCB.ino` and every
+reply string to the Wizard's parser. A second copy in another firmware drifts the first time
+one side is fixed and the other is not, and drifts *silently*, because a stale copy still
+answers — just wrongly. One module compiled by both is the same answer `WcbCmd` gives to the
+same problem.
+
+**It registers nothing with `WCB_Client`.** No `onRawPacket`, no `onCommand`, no channel
+handling — the host feeds it. That is required, not polite: `onRawPacket()` takes a single
+callback and a host may already own it (NaviCore registers its firmware-OTA hook there).
+Self-registering would silently replace that hook, with nothing visible until an update failed.
+Composing from the host's existing hook — which should already discriminate by packet length —
+is the only safe shape.
+
+**Concurrency.** `onRawPacket()` runs on the WiFi/ESP-NOW task and only copies into a queue.
+Every decode, reassembly and print happens in `service()` on the loop task, so there is exactly
+one writer to the output `Print`. A multi-packet write from the receive callback races the loop
+task and corrupts any line longer than one USB packet.
+
+`examples/MgmtRelay` keeps its own behaviour unchanged; the module is what it was built from.
+
+### 1.16.1
+
+**`MgmtRelay` can now be reached over WiFi, so a phone or desktop app can manage the
+whole mesh with no USB cable.** Library source is unchanged — this is the example
+plus a new `mgmt_wsserver.h` beside it. Off by default (`RELAY_WIFI_MODE`), and with
+it off the compiled binary is byte-identical to 1.16.0's.
+
+`RELAY_WIFI_AP` hosts a SoftAP; `RELAY_WIFI_JOIN` joins an existing one (NaviCore's,
+typically) with automatic fallback to hosting its own. Either way a WebSocket at
+`ws://<ip>/ws` carries **exactly** the newline-delimited line protocol the USB port
+already speaks — `;w3,:PP100`, bare text to broadcast — because both mouths feed the
+same `relaySerialLine()`. USB keeps working alongside it.
+
+**The mode is set from the console, not at compile time.** It and the credentials
+live in NVS, so moving a relay between a bench AP and a droid's network no longer
+means an edit, a rebuild and a reflash of a board that is already installed:
+
+```
+?RELAY,WIFI                     report the mode, SSID and address
+?RELAY,WIFI,OFF                 ESP-NOW only
+?RELAY,WIFI,AP[,<pass>]         host our own AP (optionally set its password)
+?RELAY,WIFI,JOIN,<ssid>,<pass>  join an existing AP
+?RELAY,WIFI,DEFAULTS            forget NVS, return to the compiled-in values
+```
+
+`RELAY_WIFI_MODE` is now only the **factory default**, used when NVS holds nothing.
+`RELAY_WIFI_BUILD` (default 1) decides whether the WiFi code is compiled in at all —
+a separate switch, because every mode has to be present in the image for a console
+command to be able to select it.
+
+Each of these saves and then **reboots**, once the console has been quiet for a
+moment. That is not laziness: a SoftAP must be up *before* `begin()` and a STA joined
+*after* it, so re-running that dance on a live radio would tear ESP-NOW down beneath
+a mesh that is mid-conversation. A reboot re-runs `setup()` in the one order known to
+work. It is deferred rather than immediate because a host tool sends commands as a
+stream, and restarting inside a handler discards everything queued behind it while
+the boot banner still satisfies the sender's "did it answer" test — the same trap as
+rule 11 in the WCB firmware.
+
+Passwords can be **set but never read back**. This console is mirrored to every
+connected WebSocket client, so echoing one would send it over the network it exists
+to protect.
+
+`RELAY_STATIC_IP` (on by default) pins the relay to `192.168.4.<DEVICE_ID>` —
+`192.168.4.19` out of the box — in **both** modes, so a host app needs no discovery
+and does not care whether the relay ended up hosting the AP or joining NaviCore's.
+That address cannot collide with the AP's DHCP pool, which the core fixes at eleven
+leases starting one above the AP's own IP (`NetworkInterface.cpp:451-453`) — `.2`–`.12`
+for a default `192.168.4.1` AP. Ids 2–12 land inside that pool and id 1 is the AP
+itself, so the build `static_assert`s `DEVICE_ID >= 13` rather than letting it fail in
+the field.
+
+This is deliberately the same transport NaviCore exposes (same URI, same framing, same
+console-mirror reply semantics), so a host app writes ONE client and points it at
+either box; only the payload grammar differs.
+
+Five constraints are load-bearing and are recorded in the code rather than left to
+be rediscovered:
+
+- **`JOIN` never blocks and keeps retrying.** Powered from one switch, the relay is
+  ready long before NaviCore raises its SoftAP — NaviCore mounts LittleFS, loads
+  config and allocates a ~3.1 MB PSRAM record buffer first — so a one-shot wait in
+  `setup()` loses that race on every cold boot and strands the app on a fallback AP
+  with two APs up. The join is now serviced from `loop()`, retrying every 5 s for
+  90 s with the mesh fully alive throughout, and only hosts its own AP if the other
+  never appears. Retries are affordable *because* the channel is pinned: the probe
+  is confined to the one channel we are already on instead of sweeping the band.
+
+- **The two modes have OPPOSITE ordering rules against `begin()`.** A SoftAP must be
+  raised *before* `WCB_Client::begin()`, because `begin()` inspects `WiFi.getMode()`
+  and preserves an existing AP as `WIFI_AP_STA` instead of forcing `WIFI_STA`. A STA
+  association must be made *after*, because that same `begin()` calls
+  `WiFi.disconnect()` unconditionally and would silently undo it.
+- **The channel is passed explicitly, everywhere.** `softAP()`'s channel parameter
+  defaults to 1, and once an AP owns the radio `begin()` stops calling
+  `esp_wifi_set_channel` and only warns. A defaulted channel against a mesh on any
+  other channel is a total, silent blackout. `JOIN` mode additionally *verifies* the
+  channel after associating and hangs up if it landed off-mesh — `update()` notices
+  the drift too, but it only warns, and a relay that cannot reach the mesh is useless.
+- **`JOIN` never scans.** The channel is pinned in `WiFi.begin()` and auto-reconnect
+  is off. An unpinned association sweeps every channel looking for its SSID and goes
+  deaf to the mesh for the length of each sweep; with the AP absent that repeats
+  forever, presenting not as "WiFi failed" but as the relay randomly dropping traffic.
+- **The AP fails closed without a password.** `softAP()` with an empty passphrase
+  creates an *open* network, and this WebSocket relays `;w<id>,<cmd>` to every board
+  with no credential of its own.
+
+The httpd handler runs on Core 0 beside the ESP-NOW receive callback, so it only
+copies, enqueues and returns; commands run from `loop()` on Core 1 — the same split
+`relayOutQueue` already uses, and for the same reason. Unlike NaviCore's equivalent
+the queue is by value, not a PSRAM pointer: this relay's longest input is a ~283-char
+OTA `DATA` line, so it stays within `WS_LINE_MAX` (kept in step with the sketch's
+`inBuf`) and the sketch still runs on a plain ESP32 with no PSRAM.
+
+Cost when enabled: **+37 KB flash, +4.7 KB RAM** (48% / 20% of a `min_spiffs` ESP32).
+Verified compiling on ESP32 and ESP32-S3 in all three modes.
 
 ### 1.16.0
 
