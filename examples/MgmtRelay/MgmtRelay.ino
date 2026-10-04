@@ -540,6 +540,9 @@ QueueHandle_t relayOutQueue = nullptr;
 // byte-for-byte. Flow: the relay unicasts a 43-byte config-request to the target; the target
 // broadcasts back 230-byte config-fragments (config / stats / etm — distinguished by
 // packetType) which we reassemble per session and print as [MGMT:CONFIG|STATS|ETM,<src>]<data>;
+// a config over 2912 characters comes back as type-18 messages, printed as [MGMT:CFGPART,<src>]
+// (one line per part, only ever to a "?MGMT,PULL,<n>,P"), and a target that cannot answer a pull
+// sends one printed as [MGMT:CFGERR,<src>] (see processConfigFrag);
 // a target running a remote terminal unicasts 204-byte remote-term packets which we print as
 // [TERM:<src>]<line>. The raw receive callback runs on the WiFi task, so it ONLY copies the
 // packet into a queue — all decode/reassembly/Serial output happens in loop() (single writer).
@@ -552,6 +555,17 @@ QueueHandle_t relayOutQueue = nullptr;
 #define PT_ETM_REQ      8
 #define PT_STATS_FRAG   9
 #define PT_ETM_FRAG     10
+// A config over 2912 characters (16 chunks x 182) does not fit one reply. A target asked with
+// PT_CONFIG_REQ_PARTS sends it as several messages, each its own session of 230-byte
+// PT_CONFIG_PART frags, "P<id>,<k>,<K>:<data>~" per part. A target that cannot answer a config
+// request (either type) sends one PT_CONFIG_PART message "E<CODE>,<detail>" instead: NOPARTS to a
+// plain request over the limit, NOMEM, CHANGED, TOOBIG. NEW TYPES, NEVER TYPE 6: an older relay
+// prints a completed type-6 session as [MGMT:CONFIG,<n>], and an older Wizard stores any non-empty
+// body under that tag as the board's whole config, with no CRC check. An older relay (every
+// revision of this sketch did) drops a 230-byte frag of a type it does not know before touching
+// its session, so it never passes one on.
+#define PT_CONFIG_PART      18   // target → relay, 230 B
+#define PT_CONFIG_REQ_PARTS 19   // relay → target, 43 B: "this requester takes parts"
 #define PT_REMOTE_TERM  7      // in the 204-byte struct — SIZE disambiguates from PT_STATS_REQ (43B)
 #define CFG_PAYLOAD     183    // firmware CONFIG_PAYLOAD_SIZE
 #define MGMT_CHUNKS     16     // firmware MGMT_MAX_CHUNKS (uint16 receivedMask)
@@ -638,7 +652,11 @@ typedef struct __attribute__((packed)) {
 static_assert(sizeof(relay_ota_ctrl) == 55,  "relay_ota_ctrl must be 55 B to match WCB_OTA / navicore_ota");
 static_assert(sizeof(relay_ota_data) == 243, "relay_ota_data must be 243 B to match WCB_OTA / navicore_ota");
 
-// Reassembly state for one config/stats/etm reply at a time (the Wizard requests serially).
+// ONE reassembly slot, shared by config/stats/etm replies and config parts. A session is keyed
+// on (sessionId, packetType, sourceWCB): a frag differing in any of them is another reply, never a
+// continuation, so two boards whose random sessionIds collide cannot be spliced into one line. A
+// new key normally wipes the slot; the one exception (a legacy reply keeps it against a part
+// stream) is in processConfigFrag(). The Wizard sends its pulls through a relay one at a time.
 struct FragReasm {
   bool     active      = false;
   uint8_t  packetType  = 0;
@@ -872,6 +890,32 @@ void sendConfigReq(uint8_t target, uint8_t packetType, uint8_t times) {
   }
 }
 
+// True when `s` (what follows "<n>,") is the parts flag: a 'P', then nothing but whitespace.
+// The reader below strips only CR/LF, so trailing spaces are tolerated here. Anything else is not
+// the flag and the pull goes out plain, as every older relay sends it (atoi reads "<n>,P" as <n>).
+static bool relayIsPartsFlag(const char* s) {
+  if (*s != 'P' && *s != 'p') return false;
+  for (s++; *s; s++)
+    if (*s != ' ' && *s != '\t' && *s != '\r' && *s != '\n') return false;
+  return true;
+}
+
+// ?MGMT,PULL,<n>    CONFIG_REQ (5) x3, 15 ms apart. Unchanged.
+// ?MGMT,PULL,<n>,P  CONFIG_REQ_PARTS (19) x3, THEN CONFIG_REQ (5) x3, 15 ms apart. The type-5
+//   copies keep an OLDER target answering (it drops type 19 at its receive filter); a new target
+//   accepts the first request it hears from us and ignores the rest as duplicates, so the 19s go
+//   first. Parts only ever go to a requester that sent a 19. Blocks loop() ~75 ms.
+static void sendPull(const char* args) {
+  const uint8_t target = (uint8_t)atoi(args);
+  const char*   comma  = strchr(args, ',');
+  if (comma && relayIsPartsFlag(comma + 1)) {
+    if (target < 1 || target > WCB_MAX_BOARDS) return;
+    sendConfigReq(target, PT_CONFIG_REQ_PARTS, 3);
+    delay(15);
+  }
+  sendConfigReq(target, PT_CONFIG_REQ, 3);
+}
+
 // WiFi-task callback: copy config-frag(230) / remote-term(204) packets for loop() to process.
 // MUST NOT print — a multi-packet Serial write here races Core 1 and corrupts long lines.
 void onMeshRaw(const uint8_t* mac, const uint8_t* data, int len) {
@@ -883,8 +927,18 @@ void onMeshRaw(const uint8_t* mac, const uint8_t* data, int len) {
   xQueueSend(rawInQueue, &r, 0);               // non-blocking; a dropped frag is covered by the 2nd pass
 }
 
-// loop(): reassemble a config/stats/etm reply fragment; emit [MGMT:CONFIG|STATS|ETM,<src>]<data>
-// when the session is complete. Mirrors WCB.ino handleConfigFragPacket / handleStats/ETMFragPacket.
+// How long a live config/stats/etm session holds the slot against config parts. Its frags arrive
+// 20 ms apart, so 200 ms without one means it has stalled.
+#define PART_YIELD_MS 200UL
+
+// loop(): reassemble one reply and print it as ONE line once the session is complete:
+//   type 6  (CONFIG)              -> [MGMT:CONFIG,<src>]<body>
+//   type 9 / 10  (STATS / ETM)    -> [MGMT:STATS,<src>]<body> / [MGMT:ETM,<src>]<body>
+//   type 18, body "P..." (a part) -> [MGMT:CFGPART,<src>]<body>
+//   type 18, body "E..." (error)  -> [MGMT:CFGERR,<src>]<body without the E>
+//   type 18, anything else        -> dropped
+// The relay does not join parts: the Wizard collects the K parts of one id and checks the CRC of
+// the joined text. Mirrors WCB.ino handleConfigFragPacket and WCB_Mgmt.h processConfigFrag.
 void processConfigFrag(const uint8_t* data) {
   relay_config_frag pkt;
   memcpy(&pkt, data, sizeof(pkt));
@@ -893,13 +947,25 @@ void processConfigFrag(const uint8_t* data) {
   if (pkt.requesterWCB != DEVICE_ID) return;
   if (pkt.totalChunks == 0 || pkt.totalChunks > MGMT_CHUNKS) return;
   if (pkt.chunkIdx >= MGMT_CHUNKS || pkt.chunkIdx >= pkt.totalChunks) return;
-  const char* tag = pkt.packetType == PT_CONFIG_FRAG ? "CONFIG"
-                  : pkt.packetType == PT_STATS_FRAG  ? "STATS"
-                  : pkt.packetType == PT_ETM_FRAG    ? "ETM" : nullptr;
-  if (!tag) return;
-  if (lastDeliveredSession != 0 && pkt.sessionId == lastDeliveredSession) return;  // CONFIG 2nd pass
+  if (pkt.packetType != PT_CONFIG_FRAG && pkt.packetType != PT_STATS_FRAG &&
+      pkt.packetType != PT_ETM_FRAG    && pkt.packetType != PT_CONFIG_PART) return;
+  // The 2nd pass. One value covers every reply type: a target that sends parts never gives two
+  // consecutive sessions (each part, each error) the same id.
+  if (lastDeliveredSession != 0 && pkt.sessionId == lastDeliveredSession) return;
 
-  if (!fragReasm.active || fragReasm.sessionId != pkt.sessionId) {
+  const bool sameSession = fragReasm.active && fragReasm.sessionId == pkt.sessionId &&
+                           fragReasm.packetType == pkt.packetType &&
+                           fragReasm.sourceWCB  == pkt.sourceWCB;
+  if (!sameSession) {
+    // A LEGACY REPLY KEEPS THE SLOT. A board over 2912 characters streams parts for hundreds of
+    // ms, and each part frag would wipe a config/stats/etm reply from ANOTHER board that is still
+    // arriving - possibly for an old Wizard, which never asks for parts and whose fixed retry
+    // timers would meet the stream again on every attempt. So a part frag yields to a live
+    // non-part session and is dropped; the part's second pass or the new Wizard's retry recovers
+    // it. A non-part frag always takes the slot, exactly as before parts existed.
+    if (pkt.packetType == PT_CONFIG_PART && fragReasm.active &&
+        fragReasm.packetType != PT_CONFIG_PART &&
+        (millis() - fragReasm.lastMs) < PART_YIELD_MS) return;
     memset(&fragReasm, 0, sizeof(fragReasm));
     fragReasm.active     = true;
     fragReasm.packetType = pkt.packetType;
@@ -915,14 +981,38 @@ void processConfigFrag(const uint8_t* data) {
   fragReasm.lastMs = millis();
 
   uint16_t expected = (uint16_t)((1 << pkt.totalChunks) - 1);
-  if (fragReasm.receivedMask == expected) {
-    String full = "";
-    for (int i = 0; i < pkt.totalChunks; i++) full += fragReasm.chunks[i];
-    uint8_t src = fragReasm.sourceWCB;
-    lastDeliveredSession = pkt.sessionId;
-    memset(&fragReasm, 0, sizeof(fragReasm));
-    host.printf("[MGMT:%s,%d]%s\n", tag, src, full.c_str());
+  if (fragReasm.receivedMask != expected) return;
+
+  // NO String: `full += chunk` skips a chunk SILENTLY when its allocation fails (String::concat
+  // returns false and operator+= ignores it), and a heap-starved relay would print a short but
+  // well-formed [MGMT:CONFIG] line that a Wizard stores as the board's config. Compact the chunks
+  // in place instead: each row holds at most CFG_PAYLOAD chars in CFG_PAYLOAD + 1 bytes, so the
+  // text moved down so far never reaches the next row before that row is read.
+  char*  body = reinterpret_cast<char*>(fragReasm.chunks);
+  size_t len  = 0;
+  for (int i = 0; i < pkt.totalChunks; i++) {
+    const size_t n = strlen(fragReasm.chunks[i]);
+    memmove(body + len, fragReasm.chunks[i], n);
+    len += n;
   }
+  body[len] = '\0';
+
+  const char* tag  = nullptr;
+  const char* text = body;
+  if      (fragReasm.packetType == PT_CONFIG_FRAG) tag = "CONFIG";
+  else if (fragReasm.packetType == PT_STATS_FRAG)  tag = "STATS";
+  else if (fragReasm.packetType == PT_ETM_FRAG)    tag = "ETM";
+  else if (body[0] == 'P')                         tag = "CFGPART";
+  else if (body[0] == 'E')                       { tag = "CFGERR"; text = body + 1; }
+
+  lastDeliveredSession = fragReasm.sessionId;
+  // ONE printf, tag through newline: Print::printf formats into one buffer and makes one write(),
+  // so HostOut hands USB and the WebSocket sink each the whole line in one call and nothing another
+  // task prints can land inside it or ahead of its newline (the Wizard drops a part line with
+  // anything after its '~'). If printf cannot allocate that buffer it prints nothing, and a missing
+  // line is a retry, never a wrong config.
+  if (tag) host.printf("[MGMT:%s,%d]%s\n", tag, (int)fragReasm.sourceWCB, text);
+  memset(&fragReasm, 0, sizeof(fragReasm));
 }
 
 // loop(): a remote-terminal line from a target → [TERM:<src>]<line> (trailing CR/LF stripped),
@@ -1212,14 +1302,17 @@ void relaySerialLine(char* line) {
         if (iStarts(c, "MGMT,")) {
             // Route the Wizard's remote-management verbs to the target board.
             //   FRAG      → forward config/command chunks (Phase 2a)
-            //   PULL      → request the target's config     (reply: [MGMT:CONFIG,<n>])
+            //   PULL      → request the target's config     (reply: [MGMT:CONFIG,<n>], or
+            //               [MGMT:CFGERR,<n>] when the target cannot send it)
+            //   PULL,<n>,P → the same, and accept parts: a config over 2912 chars comes back as
+            //               [MGMT:CFGPART,<n>] lines, one per part
             //   STATS     → request ESP-NOW stats            (reply: [MGMT:STATS,<n>])
             //   ETM,CHAR  → request ETM characterization     (reply: [MGMT:ETM,<n>])
             // Remote-terminal START/STOP/keystrokes ride inside a FRAG; its OUTPUT comes back
             // as [TERM:<n>] via processRemoteTerm.
             char* m = line + 6;                  // skip "?MGMT,"
             if      (iStarts(m, "FRAG,"))     handleMgmtFrag(m + 5);
-            else if (iStarts(m, "PULL,"))     sendConfigReq((uint8_t)atoi(m + 5), PT_CONFIG_REQ, 3);
+            else if (iStarts(m, "PULL,"))     sendPull(m + 5);
             else if (iStarts(m, "STATS,"))    sendConfigReq((uint8_t)atoi(m + 6), PT_STATS_REQ, 1);
             else if (iStarts(m, "ETM,CHAR,")) sendConfigReq((uint8_t)atoi(m + 9), PT_ETM_REQ,   1);
             return;

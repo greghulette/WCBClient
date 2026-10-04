@@ -75,6 +75,8 @@ bool WCB_Client::begin() {
 
     // ── Reset internal state ─────────────────────────────────────────────────
     _seqCounter      = 0;
+    _bootAnnouncesLeft  = 3;                       // see _sendBootAnnounce()
+    _nextBootAnnounceMs = 0;                       // first one goes out on the next update()
     _nextHeartbeatMs = 0;                          // Triggers heartbeat immediately on
                                                    // first update() call
     memset(_boards,  0, sizeof(_boards));
@@ -209,6 +211,13 @@ void WCB_Client::update() {
 
     unsigned long now = millis();
 
+    // Boot announces first: three, ~1200 ms apart, matching the firmware. Driven from here
+    // rather than begin() so joining is never blocked by them.
+    if (_bootAnnouncesLeft > 0 && now >= _nextBootAnnounceMs) {
+        _sendBootAnnounce();
+        _bootAnnouncesLeft--;
+        _nextBootAnnounceMs = now + 1200;
+    }
     if (now >= _nextHeartbeatMs) {
         _sendHeartbeat();
         _nextHeartbeatMs = now + (_heartbeatIntervalSec * 1000UL);
@@ -391,6 +400,12 @@ bool WCB_Client::broadcast(const char* command, bool ensured) {
                       (unsigned)strlen(command), (unsigned)_maxSingleCommandLen());
         return false;
     }
+    // A JSON broadcast is best-effort BY PROTOCOL: the WCB deliberately does not ACK a target-0
+    // '{' frame (it is consumed by the telemetry relay, never run as a command), so an ensured
+    // one can never complete - it times out and retries as unicast, and every board then
+    // processes the payload a second time. Force best-effort rather than let ensured=true, the
+    // default, quietly mean 'deliver twice'.
+    if (command[0] == '{') ensured = false;
     return _sendPacket(WCB_TARGET_BROADCAST, command, ensured);
 }
 
@@ -1797,6 +1812,26 @@ void WCB_Client::clearLearnedPeers() {
 // WCB "I am alive." WCBs that don't see a heartbeat within the expected window
 // will mark this device offline and may stop routing messages to it.
 // ─────────────────────────────────────────────────────────────────────────────
+// Announce our boot the way a WCB does. A WCB clears a sender's duplicate ring ONLY on that
+// sender's boot announce; without this, a client that reboots reuses sequence numbers the WCB
+// still holds, so its first commands are ACKed and then dropped as duplicates - invisible at
+// both ends. Unacknowledged, hence sent redundantly (the firmware does the same).
+void WCB_Client::_sendBootAnnounce() {
+    if (!_started) return;
+
+    wcb_packet_etm_t ba;
+    memset(&ba, 0, sizeof(ba));
+
+    strncpy(ba.structPassword, _password, sizeof(ba.structPassword) - 1);
+    snprintf(ba.structSenderID, sizeof(ba.structSenderID), "%d", _deviceID);
+    snprintf(ba.structTargetID, sizeof(ba.structTargetID), "0");   // 0 = broadcast
+    ba.structCommandIncluded = 0;
+    ba.structPacketType      = WCB_PACKET_ETM_BOOT;
+    ba.structSequenceNumber  = 0;
+
+    esp_now_send(_broadcastMAC, (uint8_t*)&ba, sizeof(ba));
+}
+
 void WCB_Client::_sendHeartbeat() {
     if (!_started) return;   // ESP-NOW not up — never touch esp_now_send()
 
@@ -2681,9 +2716,54 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
         case WCB_PACKET_HEARTBEAT:
             if (senderID >= 1 && senderID <= WCB_MAX_BOARDS) {
                 int  idx        = senderID - 1;
+                // Only a sender _checkOfflineBoards() also sweeps (floor, learned, special peer) may
+                // be marked online - otherwise nothing ever marks it offline again. A temporary
+                // client above the floor heartbeats too; it is tracked through its WDP neighbour row
+                // (getNeighbor, which ages out), not here. (HIL navicore.probe_temp_peer_not_learned.)
+                if (!(idx < _quantity || _learnedPeer[idx] || senderID == _specialPeerID)) break;
                 bool wasOffline = !_boards[idx].online;
                 _boards[idx].online     = true;
                 _boards[idx].lastSeenMs = millis();
+                if (wasOffline && _statusCallback)
+                    _statusCallback((uint8_t)senderID, true);
+            }
+            break;
+
+        // ── Boot announce ────────────────────────────────────────────────────
+        // A WCB sends a few of these right after it (re)starts, and its ETM
+        // sequence counter restarts at 0. Our anti-replay window still held the
+        // seqs it used before the reboot, so until its counter climbed back past
+        // the old high, a new command whose seq landed on a remembered one was
+        // dropped as a duplicate: some ;W<id> commands ran and others silently
+        // did not. Forget the window, as the WCB firmware clears its own ring on
+        // the same packet, and count the announce as presence like a heartbeat.
+        // Clear once per boot: the three announces arrive ~1.2 s apart, and a
+        // command the WCB sends between them whose ACK is lost is retried — a
+        // second clear would let that retry run the command twice.
+        // Same RX task as _cmdSeqDup, so the window stays lock-free.
+        case WCB_PACKET_ETM_BOOT:
+            if (senderID >= 1 && senderID <= WCB_MAX_BOARDS) {
+                int           idx        = senderID - 1;
+                bool          wasOffline = !_boards[idx].online;
+                unsigned long now        = millis();
+                // Mark it online only if _checkOfflineBoards() will also mark it OFFLINE again: floor
+                // peers, learned peers and the special peer. Clients send boot announces too (so a
+                // WCB clears their duplicate ring), and a TEMPORARY client above the floor is none of
+                // those - marked online here, the sweep skipped it forever, so it stayed 'known'
+                // after it left (HIL navicore.probe_temp_peer_not_learned, 2026-09-22). Its duplicate
+                // ring is still cleared below.
+                const bool tracked = idx < _quantity || _learnedPeer[idx] || senderID == _specialPeerID;
+                if (tracked) {
+                    _boards[idx].online     = true;
+                    _boards[idx].lastSeenMs = now;
+                } else {
+                    wasOffline = false;   // no online transition to report for an untracked sender
+                }
+                if (!_boards[idx].seqResetMs || now - _boards[idx].seqResetMs > WCB_BOOT_RESET_HOLD_MS) {
+                    _boards[idx].haveCmdSeq = false;
+                    _boards[idx].cmdSeqMask = 0;
+                    _boards[idx].seqResetMs = now ? now : 1;
+                }
                 if (wasOffline && _statusCallback)
                     _statusCallback((uint8_t)senderID, true);
             }

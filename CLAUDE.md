@@ -73,8 +73,9 @@ explicitly on anything new, either way.
 only; `requestSequence()` returns ONE value by key. There is deliberately no "fetch every
 sequence" call — a single value is bounded (~1800 chars ≈ 10 of 16 chunks) but the total is
 not, and the WCB config pull already demonstrates the failure mode: it carries values,
-exceeds ~2912 chars on a real board, and then returns **nothing** with the diagnostic behind
-a debug flag. Adding a bulk fetch walks straight back into that. Consumers walk the name
+exceeds 2912 chars on a real board, and past that arrives only in parts, which took a new
+packet type, a whole-config CRC and a new Wizard to make safe (`?MGMT,PULL,<n>,P`,
+`src/WCB_Mgmt.h`). Adding a bulk fetch walks straight back into that. Consumers walk the name
 list instead. `WCBNeighbor::seqHash` (WDP TLV `0x13`) covers names **and** values, so it is
 also how you confirm a write landed. Design doc lives in the WCB repo,
 `docs/SEQUENCE_INVENTORY.md`.

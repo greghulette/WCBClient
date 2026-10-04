@@ -49,6 +49,7 @@ class WCBStream;
 #define WCB_PACKET_COMMAND    0   // A text command (or raw binary) directed at a target
 #define WCB_PACKET_ACK        1   // Acknowledgement that a COMMAND was received
 #define WCB_PACKET_HEARTBEAT  2   // Periodic keepalive broadcast — no command payload
+#define WCB_PACKET_ETM_BOOT  11   // A WCB's "I just (re)booted" announce (matches firmware PACKET_TYPE_ETM_BOOT)
 #define WCB_PACKET_WDP       12   // WDP device-identity advert (matches firmware PACKET_TYPE_WDP)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +274,12 @@ struct WCBBoardStatus {
     bool          haveCmdSeq = false;
     uint16_t      cmdSeqHigh = 0;   // highest COMMAND seq seen from this board
     uint32_t      cmdSeqMask = 0;   // 32-wide backlog of recently-seen older seqs
+    unsigned long seqResetMs = 0;   // millis() when a boot announce last cleared the window (0 = never)
 };
+
+// A rebooted WCB sends three boot announces ~1.2 s apart. The anti-replay window is cleared on the first one only;
+// later announces from the same board within this hold are presence only (see the WCB_PACKET_ETM_BOOT case).
+#define WCB_BOOT_RESET_HOLD_MS 4000
 
 // Tracks an in-flight COMMAND that is waiting for an ACK.
 // When an ACK arrives with a matching seqNum the slot is updated; a unicast
@@ -1082,6 +1088,8 @@ private:
     // rather than a live bug. Left in so it stays unreachable.
     std::atomic<uint16_t> _seqCounter{0};  // monotonic per-COMMAND sequence number
     unsigned long _nextHeartbeatMs;  // millis() when the next heartbeat is due
+    uint8_t       _bootAnnouncesLeft  = 0;   // boot announces still to send (3 at begin())
+    unsigned long _nextBootAnnounceMs = 0;   // millis() when the next one is due
 
     // ETM timing — defaults match WCB firmware factory defaults.
     // Changing these here without matching changes on the WCBs will cause
@@ -1225,6 +1233,7 @@ private:
 
     // Build and broadcast a HEARTBEAT packet so all WCBs know this device is alive.
     void _sendHeartbeat();
+    void _sendBootAnnounce();   // clears this device's duplicate ring on every WCB that hears it
 
     // Compare the radio's current channel to _meshChannel; emit a rate-limited
     // warning if they differ (a hosted SoftAP can move the radio off the mesh).

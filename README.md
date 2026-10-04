@@ -540,10 +540,50 @@ Notes:
 - A request with no complete answer within ~4 s is abandoned silently — no callback fires,
   because a half-list would look like a real answer. Just call again.
 - `requestSequenceNames()` returns `false` unless a callback is registered first.
-- Names only, never contents. The values live in the board's config pull, which caps at
-  ~2912 characters for the *entire* board config and returns nothing at all when exceeded.
+- Names only, never contents. The values live in the board's config pull, which fits one
+  reply only up to 2912 characters for the *entire* board config; past that it takes a
+  multi-part protocol and a requester that asks for parts (see
+  [Management relay](#management-relay-wcb_mgmth)). A bulk fetch here would have walked into
+  the same ceiling.
 
 Full example: [`examples/SequenceInventory`](examples/SequenceInventory).
+
+### Management relay (`WCB_Mgmt.h`)
+
+`WcbMgmt` makes a `WCB_Client` host the WCB Wizard's doorway into the mesh, answering on
+whatever `Print` the host passes to `begin()`. The host wires it in with four calls
+(`begin()`, `handleLine()`, `onRawPacket()`, `service()`; see the 1.17.0 notes below).
+`examples/MgmtRelay` keeps its own copy of the same surface, with the same wire behaviour.
+
+| Line from the Wizard | Sent on the mesh | Printed back |
+|---|---|---|
+| `?MGMT,PULL,<n>` | CONFIG_REQ (type 5) ×3 | `[MGMT:CONFIG,<n>]<config>`, or `[MGMT:CFGERR,<n>]<code>,<detail>` |
+| `?MGMT,PULL,<n>,P` | CONFIG_REQ_PARTS (type 19) ×3, then CONFIG_REQ (5) ×3 | as above, or one `[MGMT:CFGPART,<n>]P<id>,<k>,<K>:<data>~` line per part |
+| `?MGMT,STATS,<n>` | STATS_REQ (7) | `[MGMT:STATS,<n>]<text>` |
+| `?MGMT,ETM,CHAR,<n>` | ETM_REQ (8) | `[MGMT:ETM,<n>]<text>` |
+| `?MGMT,FRAG,<n>,<sid>,<idx>,<total>,<payload>` | the chunk, forwarded | a `[relay] MGMT -> WCB<n> …` note |
+
+- **A config of up to 2912 characters is one `[MGMT:CONFIG,<n>]` line, exactly as before.**
+  Above that, a WCB that supports parts sends the config in parts, but only to a requester
+  that asked with `,P`. The relay prints each part as it completes and never joins them; the
+  requester collects the `K` parts of one `id`, joins them in order and checks the CRC
+  (`^?CHK`) of the whole. An older WCB ignores type 19 and answers the type-5 copies as it
+  always has — with nothing, for a config over the limit.
+- **Parts and errors ride packet type 18, never type 6.** Every older relay drops type 18
+  silently, and every older Wizard stores any non-empty `[MGMT:CONFIG,<n>]` body as the
+  board's config without checking it, so a part must never be able to look like one.
+- `[MGMT:CFGERR,<n>]` is a code and a short ASCII detail, never config text: `NOPARTS` (over
+  the limit, and the request did not ask for parts), `TOOBIG` (would need more than 16
+  parts), and `NOMEM` and `CHANGED`, which are worth retrying.
+- **One reassembly slot.** A reply is keyed on (session id, packet type, source board), and a
+  part never displaces a CONFIG/STATS/ETM reply that is still arriving (a frame within the
+  last 200 ms): the part is dropped and recovered by the target's second pass or a retry.
+  Send pulls through one relay one at a time.
+- Every line is printed from `service()`, on the loop task, with one `printf`, so nothing
+  another task prints can land inside it. `?MGMT,PULL,<n>,P` blocks the calling task for about
+  75 ms (six request frames, 15 ms apart; a plain pull is about 30 ms).
+- A pulled config holds the board's secrets (`?EPASS`, and a WiFi passphrase where one is
+  set). Don't log these lines.
 
 ---
 
@@ -734,6 +774,50 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.17.1
+
+- **A rebooted WCB's commands are no longer dropped as duplicates.** The inbound anti-replay
+  window keeps the highest COMMAND sequence number seen from each board plus 32 older ones. A
+  WCB restarts its sequence counter at 0 when it reboots, so a client that stayed up (NaviCore)
+  kept the old window: until the WCB's counter climbed back past the old high, any command whose
+  new number landed on a remembered one was ACKd and silently discarded — some `;W<id>` commands
+  ran and others did not. The client now handles the WCB boot announce (packet type 11,
+  `WCB_PACKET_ETM_BOOT`) by forgetting that board's window, the same thing the WCB firmware does
+  to its own duplicate ring, and counts the announce as presence like a heartbeat. The window is
+  cleared once per boot: the three announces arrive about 1.2 s apart, and further announces from
+  that board within `WCB_BOOT_RESET_HOLD_MS` (4 s) are presence only, so a command sent between
+  them whose ACK was lost is not run a second time by its retry. The announce is an unacknowledged
+  broadcast, so a window can still survive if all three are lost, and a board that reboots again
+  within 4 s of its previous boot's first announce is not cleared. Found by the WCB
+  hardware-in-the-loop bench.
+- **The client announces its own boot.** `begin()` now sends the same three boot announces a WCB
+  does (about 1.2 s apart, from `update()`, so joining is never blocked). A WCB clears a sender's
+  duplicate ring only on that sender's boot announce, and a client restarts its sequence counter
+  at every `begin()` — so before this, a rebooted client's first commands could be ACKd and then
+  dropped as duplicates. `broadcast()` also sends a `{`-prefixed (JSON) payload best-effort even
+  with `ensured` true: a WCB never ACKs a target-0 JSON frame, so an ensured one could only time
+  out and be re-sent as unicast, reaching every board twice.
+- **A heartbeat or boot announce no longer marks an untracked sender online.** Only a floor peer,
+  a learned peer or the special peer is marked online by them, because those are the only boards
+  `update()`'s offline check ever marks offline again. A temporary client above the floor (a
+  management relay, a bench probe) heartbeats and now announces its boot too; marked online, it
+  stayed online and "known" forever after it left. It is tracked through its WDP neighbour row
+  instead, which ages out. Found by the WCB hardware-in-the-loop bench.
+- **`WcbMgmt` and `MgmtRelay`: a config over 2912 characters can be pulled in parts, and a
+  refusal arrives as a coded error.** `?MGMT,PULL,<n>,P` sends three CONFIG_REQ_PARTS requests
+  (packet type 19) ahead of the usual three CONFIG_REQs. A WCB with parts support answers an
+  over-limit config with type-18 messages, printed as `[MGMT:CFGPART,<n>]` lines, and a request
+  it cannot serve with `[MGMT:CFGERR,<n>]<code>,<detail>`; an older WCB ignores type 19 and
+  answers the CONFIG_REQs as before. They are new tags on a new packet type because every older
+  relay prints a type-6 reply as `[MGMT:CONFIG,<n>]` and every older Wizard stores that as the
+  board's config with no CRC check. Replies are now keyed on (session, type, source board)
+  rather than on the session alone, so two boards' replies can no longer be spliced into one
+  line; a part never displaces a CONFIG/STATS/ETM reply that is still arriving; and a reply is
+  assembled in place instead of through `String`, whose `+=` skipped a chunk silently when an
+  allocation failed and could print a short but well-formed `[MGMT:CONFIG]` line. A plain
+  `?MGMT,PULL,<n>` sends what it always sent, and every existing reply line is byte for byte
+  what it was. See [Management relay](#management-relay-wcb_mgmth).
 
 ### 1.17.0
 
