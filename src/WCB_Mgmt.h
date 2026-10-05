@@ -345,16 +345,20 @@ inline void handleMgmtFrag(char* frag) {
   // MGMT_FRAG so the target reassembles per session, exactly as it would from a
   // WCB relay. Going through send() would re-fragment it against a different size
   // cap and the target would reassemble garbage.
-  config_frag pkt;
+  // The frame is the firmware's own push struct (espnow_struct_mgmt, 226 B), as
+  // examples/MgmtRelay sends it. A WCB routes a raw frame by its SIZE: this used to
+  // be a config_frag, the 230 B REPLY layout, which never reached the target's
+  // reassembly, so every push of more than one chunk through a WcbMgmt host was
+  // lost (NaviCore D-NC48, HIL ncmesh.mgmt_frag_multichunk).
+  wcb_packet_mgmt_t pkt;
   memset(&pkt, 0, sizeof(pkt));
   strncpy(pkt.structPassword, detail::me.meshPassword, sizeof(pkt.structPassword) - 1);
-  pkt.packetType   = PT_MGMT_FRAG;     // 3 = wizard-origin (target re-broadcast allowed)
-  pkt.sourceWCB    = detail::me.deviceId;
-  pkt.requesterWCB = detail::me.deviceId;
-  pkt.sessionId    = sid;
-  pkt.chunkIdx     = idx;
-  pkt.totalChunks  = total;
-  strncpy(pkt.payload, payload, CFG_PAYLOAD - 1);
+  pkt.packetType  = WCB_MGMT_PACKET_TYPE_FRAG;   // 3 = wizard-origin (target re-broadcast allowed)
+  pkt.targetWCB   = target;
+  pkt.sessionId   = sid;
+  pkt.chunkIdx    = idx;
+  pkt.totalChunks = total;
+  strncpy(pkt.payload, payload, sizeof(pkt.payload) - 1);
   detail::wcb->sendRawPacket(target, (const uint8_t*)&pkt, sizeof(pkt));
   detail::out->printf("[relay] MGMT -> WCB%d frag %u/%u (session %04X)\n",
                       target, idx + 1, total, sid);

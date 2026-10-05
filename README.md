@@ -775,6 +775,15 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 
 ## Changelog
 
+### 1.17.2
+
+- **A config push of more than one chunk through a `WcbMgmt` host now reaches the board.**
+  `?MGMT,FRAG` with a total above 1 forwarded each chunk as a `config_frag`, the 230-byte
+  layout of a config *reply*. A WCB routes a raw frame by its size and reassembles a push only
+  from its 226-byte push struct, so the chunks were dropped and the push never ran. They now go
+  as `wcb_packet_mgmt_t`, the frame `examples/MgmtRelay` already sends. A single-chunk push was
+  never affected. (NaviCore D-NC48.)
+
 ### 1.17.1
 
 - **A rebooted WCB's commands are no longer dropped as duplicates.** The inbound anti-replay
