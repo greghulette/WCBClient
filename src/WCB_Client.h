@@ -114,6 +114,13 @@ constexpr uint8_t broadcast = 0;
                               // (~3 missed 15s temp adverts) so a powered-off relay clears from the
                               // roster in <1 min instead of lingering the full ~3 min neighbor TTL.
 
+// ── Transmit watchdog (setTxWatchdog, 1.18.0) ───────────────────────────────
+#define WCB_TXWD_PROBE_MS   30000UL  // default: prove the mesh still hears this device this often
+#define WCB_TXWD_ANSWER_MS   2500UL  // a WCB answers a solicit within 0.6 s (WCB_WDP.cpp jitter); wait this long
+#define WCB_TXWD_RETRY_MS    5000UL  // once a probe goes unanswered, ask again this soon
+#define WCB_TXWD_MISSES      3       // unanswered probes in a row that make a stall (one lost frame is not)
+#define WCB_TXWD_HEARD_MS   15000UL  // a judge must have been heard this recently (WCB heartbeats are ~10 s)
+
 // ── Ensured-delivery (ETM) retransmit tuning ─────────────────────────────────
 // Applies ONLY to send()/broadcast() calls made with ensured=true. These values
 // MIRROR the WCB firmware's own ETM retry engine (processETMAcksAndRetries) so
@@ -428,6 +435,30 @@ typedef void (*WCBCommandCallback)(uint8_t senderID, const char* command);
 // The library tracks online/offline state internally regardless of whether this
 // callback is registered — use isOnline() to poll status at any time.
 typedef void (*WCBStatusCallback)(uint8_t wcbID, bool online);
+
+// ── Transmit watchdog (1.18.0, setTxWatchdog) ────────────────────────────────
+// Called when the watchdog's level changes. Runs from update() - the LOOP task -
+// so flash, NVS, allocation and even a restart are safe inside it.
+//   level 1 : boards this device still hears have stopped answering it (WDP
+//             solicits drew no advert and no ACK came, WCB_TXWD_MISSES probes in a
+//             row); the library has just restarted ESP-NOW and put the mesh MAC back
+//   level 2 : still unanswered WCB_TXWD_MISSES probes after that restart - the
+//             library cannot fix it from here, and a reboot of this device may. It
+//             fires again after every further restart the library tries.
+//   level 0 : answered again (after a level 1 or 2)
+//   stalledMs : how long the mesh has not answered (for level 0: how long it was)
+typedef void (*WCBTxStallCallback)(uint8_t level, uint32_t stalledMs);
+
+// A snapshot of the transmit watchdog (getTxWatchStatus).
+struct WCBTxWatchStatus {
+    bool     enabled;
+    uint8_t  level;         // 0 answered, 1 ESP-NOW restarted, 2 still unanswered after that
+    uint8_t  misses;        // probes in a row that drew no answer
+    uint32_t probes;        // WDP solicits the watchdog has sent
+    uint32_t restarts;      // ESP-NOW restarts the watchdog has made
+    uint32_t sendErrors;    // esp_now_send() calls that returned an error, all senders
+    uint32_t sinceProofMs;  // ms since the mesh last showed it hears this device; 0xFFFFFFFF = never
+};
 
 // Called for any received ESP-NOW packet whose size is NOT the standard
 // wcb_packet_etm_t (252 B) — e.g. an application layer's own structs (the
@@ -750,6 +781,49 @@ public:
     // around send(specialPeerID, ...). Returns false if enableSpecialPeer() was
     // never called.
     bool sendToSpecialPeer(const char* command, bool ensured = true);
+
+    // ── Transmit watchdog (1.18.0) ─────────────────────────────────────────────
+    //
+    // Off by default. A device can go on HEARING the mesh while nothing it sends
+    // arrives: NaviCore did, for 20 minutes, after ten minutes of heavy relayed
+    // traffic (WCB repo HIL run 20261014-084137) - every WCB listed it offline and
+    // dropped out of its WDP table while its own roster showed them all online, and
+    // only a reboot brought it back. Nothing on the device could see it, because
+    // broadcasts are never acknowledged.
+    //
+    // With the watchdog on, the library proves every `probeIntervalMs` that the mesh
+    // still hears this device, using only what WCBs already do: it broadcasts a WDP
+    // SOLICIT (as ?WDP,POLL does) and expects a fresh advert from a board within
+    // WCB_TXWD_ANSWER_MS - a WCB answers a solicit within 0.6 s and prints nothing
+    // unless ?DEBUG,MGMT is on. An ACK to any send counts as proof too, and makes the
+    // next probe unnecessary. Only boards heard within WCB_TXWD_HEARD_MS that have
+    // advertised before are asked, so a fleet with WDP off, or with nobody around,
+    // is never judged. WCB_TXWD_MISSES unanswered probes in a row (WCB_TXWD_RETRY_MS
+    // apart once one is missed) restart ESP-NOW and put the mesh MAC back (level 1);
+    // as many more after that report level 2 to onTxStall(), where the app decides
+    // whether to reboot. Every level change is printed with the radio's MAC,
+    // channel, send errors and internal heap, so the cause can be read off the log.
+    //
+    // Cost while healthy: one ~10-byte broadcast per interval and one advert back
+    // from each board. Call after begin() or before it.
+    //   probeIntervalMs : 5000 - 600000 (clamped); default WCB_TXWD_PROBE_MS
+    void setTxWatchdog(bool enabled, uint32_t probeIntervalMs = WCB_TXWD_PROBE_MS);
+
+    // Register or replace the watchdog's level-change callback (see
+    // WCBTxStallCallback). Fires on the LOOP task, from update().
+    void onTxStall(WCBTxStallCallback callback);
+
+    // A snapshot of the watchdog's counters. Safe from loop().
+    WCBTxWatchStatus getTxWatchStatus() const;
+
+    // TEST ONLY - a fault injector for hardware-in-the-loop tests. Every frame this
+    // library would send is reported as sent and never handed to the radio, as a
+    // wedged radio's would be:
+    //   mode 1 : until the watchdog's next ESP-NOW restart (the recovery it can make)
+    //   mode 2 : until reboot (the case only a reboot fixes)
+    //   mode 0 : off
+    // RAM only. Never call it in a shipping sketch.
+    void debugTxWedge(uint8_t mode);
 
     // ── Callbacks ────────────────────────────────────────────────────────────
 
@@ -1103,6 +1177,32 @@ private:
     uint8_t       _meshChannel       = WCB_MESH_CHANNEL;  // expected ESP-NOW channel (1–13)
     uint8_t       _lastWarnedChannel = 0;                 // last off-channel value we warned about (0 = none)
     unsigned long _lastChannelWarnMs = 0;                 // millis() of the last mismatch warning (rate-limit)
+
+    // ── Transmit watchdog (setTxWatchdog) ────────────────────────────────────
+    // _txwdProofMs/_txwdAdvertMs are written on the RX task and read on the loop
+    // task: single aligned words, compared with rollover-safe subtraction.
+    bool                   _txwdEnabled  = false;
+    uint32_t               _txwdProbeMs  = WCB_TXWD_PROBE_MS;
+    unsigned long          _txwdNextMs   = 0;   // next probe due
+    unsigned long          _txwdSentMs   = 0;   // the outstanding probe's send time (0 = none)
+    volatile unsigned long _txwdProofMs  = 0;   // RX task: an ACK arrived (the mesh hears us)
+    volatile unsigned long _txwdAdvertMs = 0;   // RX task: a board's WDP advert arrived
+    uint8_t                _txwdMisses   = 0;   // unanswered probes in a row
+    uint8_t                _txwdLevel    = 0;   // 0 answered, 1 ESP-NOW restarted, 2 still unanswered
+    unsigned long          _txwdStallMs  = 0;   // when the first unanswered probe went out (0 = none)
+    uint32_t               _txwdProbes   = 0;
+    uint32_t               _txwdRestarts = 0;
+    volatile uint32_t      _txSendErrors = 0;   // every sender, both tasks
+    volatile uint8_t       _txWedge      = 0;   // debugTxWedge: 0 off, 1 until an ESP-NOW restart, 2 until reboot
+    WCBTxStallCallback     _txStallCb    = nullptr;
+
+    esp_err_t _espSend(const uint8_t* mac, const uint8_t* data, size_t len);   // EVERY send goes through here
+    void      _txWatchTick(unsigned long now);
+    bool      _txHaveJudge(unsigned long now) const;   // a board heard lately that has advertised before
+    void      _txWatchAnswered(unsigned long now);
+    void      _txWatchLevel(uint8_t level, unsigned long now);
+    void      _sendWdpSolicit();
+    void      _restartEspNow();
 
     // ── WDP device-identity advert ───────────────────────────────────────────
     // Set via setIdentity(); broadcast on the mesh as WCB_PACKET_WDP so WCBs

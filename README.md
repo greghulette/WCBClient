@@ -585,6 +585,49 @@ whatever `Print` the host passes to `begin()`. The host wires it in with four ca
 - A pulled config holds the board's secrets (`?EPASS`, and a WiFi passphrase where one is
   set). Don't log these lines.
 
+### Transmit watchdog (1.18.0)
+
+A device can go on **hearing** the mesh while nothing it sends arrives. NaviCore did, for 20
+minutes, after ten minutes of heavy relayed traffic: every WCB listed it offline and dropped it
+from WDP while its own roster showed every board online, and only a reboot brought it back.
+Broadcasts are never acknowledged, so nothing on the device could see it.
+
+```cpp
+wcb.onTxStall(onTxStall);        // optional: hear about it on the loop task
+wcb.setTxWatchdog(true);         // off by default; probe every WCB_TXWD_PROBE_MS (30 s)
+
+void onTxStall(uint8_t level, uint32_t stalledMs) {
+  if (level == 2) ESP.restart(); // the library could not fix it - a reboot did, in the field
+}
+```
+
+- **The probe is a WDP SOLICIT**, the frame `?WDP,POLL` sends. A WCB answers it with an advert
+  within 0.6 s and prints nothing (unless `?DEBUG,MGMT` is on). An advert after the probe, or an
+  ACK to anything this device sent, proves the mesh hears it; an ACK also makes the next probe
+  unnecessary. Cost while healthy: one ~10-byte broadcast per interval and one advert back
+  from each board.
+- **Only boards that can answer are asked**: heard within `WCB_TXWD_HEARD_MS` (15 s) and known to
+  advertise. A fleet with WDP off, or nobody around, is never judged — no false stall.
+- **`WCB_TXWD_MISSES` (3) unanswered probes in a row**, `WCB_TXWD_RETRY_MS` (5 s) apart once one is
+  missed, are a stall: level 1. The library puts the mesh MAC back on the STA interface if the
+  radio lost it, restarts ESP-NOW and registers every peer again (floor, broadcast, special,
+  learned — from RAM, no NVS write). As many more misses after that are level 2, reported again
+  after each further restart the library tries; at level 2 it probes at the normal interval.
+- **Every level change is printed** with the radio's STA MAC (and whether it is still the mesh
+  MAC), its channel against the mesh channel, `esp_now_send()` errors and the internal heap —
+  the evidence a wedge leaves:
+  `[WCB_Client] mesh transmit stalled: 3 WDP solicit(s) in a row unanswered for 15 s while boards
+  are heard (STA MAC 02:05:4B:00:00:14 as set, channel 1 of mesh 1, send errors 0, internal heap
+  free … largest … min …) - restarting ESP-NOW`, then `… mesh transmit recovered: the boards
+  answer again after N s unanswered`.
+- **`onTxStall(level, stalledMs)` fires on the loop task** (from `update()`), so a callback may
+  touch flash or restart the device. Level 0 means answered again.
+- `getTxWatchStatus()` returns enabled, level, misses, probes, restarts, send errors and the ms
+  since the mesh last answered.
+- `debugTxWedge(mode)` is a **test-only fault injector**: every frame is reported as sent and
+  never reaches the radio — until the watchdog's ESP-NOW restart (1) or until reboot (2).
+  Never call it in a shipping sketch.
+
 ---
 
 ## Callbacks
@@ -769,11 +812,23 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 | `NeighborDiscovery` | Learn the mesh over WDP — who's out there and what they can do |
 | `DeliveryStats` | Per-peer delivery counters, with a guided two-board bench procedure that proves each one |
 | `MgmtRelay` | Turn any ESP32 into a management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port, and optionally over a WebSocket from its own SoftAP or NaviCore's  |
+| `TxWatchdog` | Turn on the transmit watchdog and reboot when the library cannot recover the mesh |
 | `AllFeatures` | Interactive "kitchen sink" — every public method in one sketch, including a `t` key that dumps per-peer delivery statistics and `z` to reset them |
 
 ---
 
 ## Changelog
+
+### 1.18.0
+
+- **Transmit watchdog** (`setTxWatchdog`, `onTxStall`, `getTxWatchStatus`, `debugTxWedge`; off by
+  default). Proves every 30 s, with the WDP SOLICIT `?WDP,POLL` uses, that boards this device
+  hears still hear it; after 3 unanswered probes it puts the mesh MAC back, restarts ESP-NOW and
+  re-registers every peer, and reports level 2 to the app if that does not help. Found on
+  NaviCore: after ten minutes of relayed traffic it heard every WCB and none heard it, for 20
+  minutes, until a reboot (WCB repo HIL run 20261014-084137). See *Transmit watchdog* above.
+- Every frame the library sends now goes through one wrapper (`_espSend`), which counts
+  `esp_now_send()` errors for the watchdog's report.
 
 ### 1.17.2
 

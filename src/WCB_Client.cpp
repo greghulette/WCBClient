@@ -1,6 +1,7 @@
 #include "WCB_Client.h"
 #include "WCBStream.h"
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include <Preferences.h>   // learned-peer persistence (NVS)
 
 // Singleton instance pointer — allows the static ESP-NOW callback to route
@@ -223,6 +224,7 @@ void WCB_Client::update() {
         _nextHeartbeatMs = now + (_heartbeatIntervalSec * 1000UL);
         _checkMeshChannel();   // catch a SoftAP that moved the radio off the mesh channel
     }
+    _txWatchTick(now);         // prove the mesh still hears us (setTxWatchdog; off by default)
 
     // Abandon a fragment session whose sender stopped mid-command, so a lost
     // tail cannot hold the buffer against the next one. Cheap scalar test, and
@@ -524,7 +526,7 @@ void WCB_Client::_processFragJob() {
     if (n > WCB_MGMT_CHUNK_LEN) n = WCB_MGMT_CHUNK_LEN;
     memcpy(pkt.payload, _fragJob.cmd + off, n);   // payload[180] zeroed above → NUL-safe
 
-    if (esp_now_send(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK) {
+    if (_espSend(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK) {
         _fragJob.acceptedMask |= (uint16_t)(1u << _fragJob.chunk);
     }
     _fragJob.nextSendMs = now + 10;   // pacing: don't flood the ESP-NOW TX queue
@@ -614,7 +616,7 @@ bool WCB_Client::sendRaw(uint8_t target_wcb, uint8_t target_port,
     pkt.structCommand[2] = (uint8_t)((len >> 8) & 0xFF);
     memcpy(pkt.structCommand + 3, data, len);
 
-    return esp_now_send(_wcbMACs[target_wcb - 1],
+    return _espSend(_wcbMACs[target_wcb - 1],
                         (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
 }
 
@@ -680,7 +682,7 @@ bool WCB_Client::sendKyber(const uint8_t* data, size_t len) {
     pkt.structCommand[1] = (uint8_t)((len >> 8) & 0xFF);
     memcpy(pkt.structCommand + 2, data, len);
 
-    return esp_now_send(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+    return _espSend(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1286,7 +1288,7 @@ bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
     // mesh, and the target dedups repeats inside 1.5 s, so this is still one reply.
     // Broadcast (not unicast) so this works without the target being a peer yet.
     for (int i = 0; i < 3; i++) {
-        esp_now_send(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
+        _espSend(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
         delay(15);
     }
     return true;
@@ -1324,7 +1326,7 @@ bool WCB_Client::requestSequence(uint8_t wcbNumber, const char* key) {
 
     // 3x, deduped target-side on (requester, key) — see requestSequenceNames().
     for (int i = 0; i < 3; i++) {
-        esp_now_send(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
+        _espSend(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
         delay(15);
     }
     return true;
@@ -1523,7 +1525,7 @@ bool WCB_Client::sendRawPacket(uint8_t target_wcb, const uint8_t* data, size_t l
         peer.encrypt = false;
         if (esp_now_add_peer(&peer) != ESP_OK) return false;
     }
-    return esp_now_send(mac, data, len) == ESP_OK;
+    return _espSend(mac, data, len) == ESP_OK;
 }
 
 // Enable or disable CRC32 checksum. Must match the WCB network's ?ETM,CHKSM setting.
@@ -1829,7 +1831,7 @@ void WCB_Client::_sendBootAnnounce() {
     ba.structPacketType      = WCB_PACKET_ETM_BOOT;
     ba.structSequenceNumber  = 0;
 
-    esp_now_send(_broadcastMAC, (uint8_t*)&ba, sizeof(ba));
+    _espSend(_broadcastMAC, (uint8_t*)&ba, sizeof(ba));
 }
 
 void WCB_Client::_sendHeartbeat() {
@@ -1845,7 +1847,7 @@ void WCB_Client::_sendHeartbeat() {
     hb.structPacketType      = WCB_PACKET_HEARTBEAT;
     hb.structSequenceNumber  = 0;         // Heartbeats don't use sequence numbers
 
-    esp_now_send(_broadcastMAC, (uint8_t*)&hb, sizeof(hb));
+    _espSend(_broadcastMAC, (uint8_t*)&hb, sizeof(hb));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2015,7 +2017,7 @@ void WCB_Client::_sendWdpAdvert() {
     _buildWdpPayload((uint8_t*)pkt.structCommand, sizeof(pkt.structCommand));
     pkt.structPacketType     = WCB_PACKET_WDP;
     pkt.structSequenceNumber = 0;
-    esp_now_send(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt));
+    _espSend(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt));
 }
 
 void WCB_Client::_wdpTick() {
@@ -2085,6 +2087,7 @@ void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
     nb.valid      = true;
     nb.wcbNumber  = senderWCB;
     nb.lastSeenMs = millis();
+    _txwdAdvertMs = nb.lastSeenMs ? nb.lastSeenMs : 1;   // answers a watchdog solicit sent before it
 
     int o = 2;                             // skip magic + version
     while (o + 2 <= 200) {
@@ -2193,7 +2196,7 @@ void WCB_Client::_sendAck(uint8_t targetID, uint16_t seqNum) {
     ack.structPacketType      = WCB_PACKET_ACK;
     ack.structSequenceNumber  = seqNum;  // Echo the original sequence number
 
-    esp_now_send(_wcbMACs[targetID - 1], (uint8_t*)&ack, sizeof(ack));
+    _espSend(_wcbMACs[targetID - 1], (uint8_t*)&ack, sizeof(ack));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2351,7 +2354,7 @@ bool WCB_Client::_transmit(uint8_t targetID, const char* command, uint16_t seqNu
                    ? _broadcastMAC
                    : _wcbMACs[targetID - 1];
 
-    return esp_now_send(mac, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
+    return _espSend(mac, (uint8_t*)&pkt, sizeof(pkt)) == ESP_OK;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2775,6 +2778,8 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
         // slot is freed immediately; for broadcasts the slot stays open because
         // ACKs may arrive from multiple boards.
         case WCB_PACKET_ACK:
+            // Any ACK proves a board heard something we sent: the transmit watchdog's best evidence.
+            if (senderID >= 1 && senderID <= WCB_MAX_BOARDS) { unsigned long t = millis(); _txwdProofMs = t ? t : 1; }
             // Runs on Core 0 (WiFi/RX task). Serialize against the loop task's
             // slot claim+fill in _sendPacket so we never match/mutate a slot that
             // is being half-written (see _pendingMux). Pure array work — no
@@ -2949,4 +2954,194 @@ uint32_t WCB_Client::_crc32(const char* data, size_t len) {
 void WCB_Client::_espNowReceiveCB(const esp_now_recv_info_t* info,
                                   const uint8_t* data, int len) {
     if (_instance) _instance->_handleReceive(info->src_addr, data, len);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transmit watchdog (setTxWatchdog, 1.18.0) — see the header for the why.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Every frame this library sends goes through here: the watchdog counts what the radio refuses, and debugTxWedge()
+// drops frames here the way a wedged radio would - "sent", never on the air. Called on the loop task and, for ACKs,
+// the ESP-NOW receive task; the counter is a plain increment, so a lost count under a race is the worst case.
+esp_err_t WCB_Client::_espSend(const uint8_t* mac, const uint8_t* data, size_t len) {
+    if (_txWedge) return ESP_OK;
+    const esp_err_t e = esp_now_send(mac, data, len);
+    if (e != ESP_OK) _txSendErrors++;
+    return e;
+}
+
+void WCB_Client::setTxWatchdog(bool enabled, uint32_t probeIntervalMs) {
+    if (probeIntervalMs < 5000UL)   probeIntervalMs = 5000UL;
+    if (probeIntervalMs > 600000UL) probeIntervalMs = 600000UL;
+    _txwdEnabled = enabled;
+    _txwdProbeMs = probeIntervalMs;
+    _txwdSentMs  = 0;
+    _txwdMisses  = 0;
+    _txwdNextMs  = millis() + probeIntervalMs;   // no verdict before the boards have had an interval to be heard
+    if (!enabled) { _txwdLevel = 0; _txwdStallMs = 0; }
+    Serial.printf("[WCB_Client] transmit watchdog %s (a WDP solicit every %lu s while boards are heard)\n",
+                  enabled ? "on" : "off", (unsigned long)(probeIntervalMs / 1000UL));
+}
+
+void WCB_Client::onTxStall(WCBTxStallCallback callback) { _txStallCb = callback; }
+
+WCBTxWatchStatus WCB_Client::getTxWatchStatus() const {
+    WCBTxWatchStatus st;
+    st.enabled      = _txwdEnabled;
+    st.level        = _txwdLevel;
+    st.misses       = _txwdMisses;
+    st.probes       = _txwdProbes;
+    st.restarts     = _txwdRestarts;
+    st.sendErrors   = _txSendErrors;
+    const unsigned long proof = _txwdProofMs;
+    st.sinceProofMs = proof ? (uint32_t)(millis() - proof) : 0xFFFFFFFFUL;
+    return st;
+}
+
+void WCB_Client::debugTxWedge(uint8_t mode) {
+    _txWedge = mode <= 2 ? mode : 0;
+    Serial.printf("[WCB_Client] debugTxWedge(%u): %s\n", _txWedge,
+                  _txWedge == 1 ? "every frame dropped before the radio until the next ESP-NOW restart" :
+                  _txWedge == 2 ? "every frame dropped before the radio until reboot" : "off");
+}
+
+// A board that can judge whether the mesh hears us: heard within WCB_TXWD_HEARD_MS (so it is there and on our
+// channel) and known to advertise (so it answers a solicit). Nobody like that -> no verdict, never a false stall.
+bool WCB_Client::_txHaveJudge(unsigned long now) const {
+    for (int b = 0; b < WCB_MAX_BOARDS; b++) {
+        if ((b + 1) == _deviceID) continue;
+        if (!_boards[b].online || !_neighbors[b].valid) continue;
+        if (now - _boards[b].lastSeenMs < WCB_TXWD_HEARD_MS) return true;
+    }
+    return false;
+}
+
+// The same bare SOLICIT the firmware's ?WDP,POLL sends (WCB_WDP.cpp wdpSendSolicit): magic, proto, SOLICIT len 0, END.
+void WCB_Client::_sendWdpSolicit() {
+    wcb_packet_etm_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
+    snprintf(pkt.structSenderID, sizeof(pkt.structSenderID), "%d", _deviceID);
+    snprintf(pkt.structTargetID, sizeof(pkt.structTargetID), "0");   // 0 = broadcast
+    pkt.structCommandIncluded = 1;
+    uint8_t* p = (uint8_t*)pkt.structCommand;
+    p[0] = WCB_WDP_MAGIC; p[1] = WCB_WDP_PROTO; p[2] = WCB_WDP_TLV_SOLICIT; p[3] = 0; p[4] = WCB_WDP_TLV_END;
+    pkt.structPacketType     = WCB_PACKET_WDP;
+    pkt.structSequenceNumber = 0;
+    _espSend(_broadcastMAC, (uint8_t*)&pkt, sizeof(pkt));
+}
+
+void WCB_Client::_txWatchAnswered(unsigned long now) {
+    if (_txwdLevel) {
+        const uint32_t was = _txwdStallMs ? (uint32_t)(now - _txwdStallMs) : 0;
+        Serial.printf("[WCB_Client] mesh transmit recovered: the boards answer again after %lu s unanswered\n",
+                      (unsigned long)(was / 1000UL));
+        _txwdLevel = 0;
+        if (_txStallCb) _txStallCb(0, was);
+    }
+    _txwdMisses  = 0;
+    _txwdStallMs = 0;
+    _txwdProofMs = now ? now : 1;   // the last time the mesh was shown to hear us (getTxWatchStatus, next probe)
+}
+
+// Raise the level, say what the radio holds - the evidence a wedge leaves - and act on it.
+void WCB_Client::_txWatchLevel(uint8_t level, unsigned long now) {
+    _txwdLevel = level;
+    const uint32_t stalled = (uint32_t)(now - _txwdStallMs);
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    const bool macOk = memcmp(mac, _wcbMACs[_deviceID - 1], 6) == 0;
+    uint8_t ch = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&ch, &second);
+    Serial.printf("[WCB_Client] mesh transmit %s: %d WDP solicit(s) in a row unanswered for %lu s while boards are "
+                  "heard (STA MAC %02X:%02X:%02X:%02X:%02X:%02X %s, channel %u of mesh %u, send errors %lu, internal "
+                  "heap free %u largest %u min %u)%s\n",
+                  level == 1 ? "stalled" : "still stalled", WCB_TXWD_MISSES, (unsigned long)(stalled / 1000UL),
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], macOk ? "as set" : "NOT the mesh MAC", ch,
+                  _meshChannel, (unsigned long)_txSendErrors,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                  " - restarting ESP-NOW");
+    _restartEspNow();
+    if (_txStallCb) _txStallCb(level, stalled);
+}
+
+// ESP-NOW from scratch, on the loop task: the mesh MAC put back if the radio lost it, the driver re-initialised and
+// every peer registered again (floor, broadcast, special, learned - from RAM, no NVS write). The receive callback is
+// re-registered; nothing else this library holds depends on the driver's state.
+void WCB_Client::_restartEspNow() {
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    if (memcmp(mac, _wcbMACs[_deviceID - 1], 6) != 0) {
+        const esp_err_t me = esp_wifi_set_mac(WIFI_IF_STA, _wcbMACs[_deviceID - 1]);
+        Serial.printf("[WCB_Client] mesh MAC put back on the STA interface: %s\n", esp_err_to_name(me));
+    }
+    esp_now_deinit();
+    const esp_err_t e = esp_now_init();
+    if (e != ESP_OK) {
+        Serial.printf("[WCB_Client] ESP-NOW restart failed: esp_now_init() %s - the next stall tries again\n",
+                      esp_err_to_name(e));
+        return;
+    }
+    esp_now_register_recv_cb(_espNowReceiveCB);
+    _registerPeers();
+    for (int i = 0; i < WCB_MAX_BOARDS; i++) {
+        if (!_learnedPeer[i] || esp_now_is_peer_exist(_wcbMACs[i])) continue;
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, _wcbMACs[i], 6);
+        peer.channel = 0;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
+    }
+    if (_txWedge == 1) _txWedge = 0;   // debugTxWedge(1) is the wedge a restart clears
+    _txwdRestarts++;
+    _checkMeshChannel();
+}
+
+void WCB_Client::_txWatchTick(unsigned long now) {
+    if (!_txwdEnabled) return;
+
+    // A probe is out: judge it once its answer window has passed.
+    if (_txwdSentMs) {
+        if (now - _txwdSentMs < WCB_TXWD_ANSWER_MS) return;
+        const unsigned long sent = _txwdSentMs;
+        _txwdSentMs = 0;
+        const unsigned long advert = _txwdAdvertMs, proof = _txwdProofMs;
+        const bool answered = (advert && (long)(advert - sent) >= 0) || (proof && (long)(proof - sent) >= 0);
+        if (answered) {
+            _txWatchAnswered(now);
+            _txwdNextMs = now + _txwdProbeMs;
+            return;
+        }
+        if (!_txHaveJudge(now)) {             // everyone left during the wait: no verdict
+            _txwdNextMs = now + _txwdProbeMs;
+            return;
+        }
+        if (!_txwdStallMs) _txwdStallMs = sent;
+        if (++_txwdMisses >= WCB_TXWD_MISSES) {
+            _txwdMisses = 0;
+            _txWatchLevel(_txwdLevel == 0 ? 1 : 2, now);
+        }
+        // At level 2 the library has done what it can: ask at the normal pace, not every few seconds.
+        _txwdNextMs = now + (_txwdLevel >= 2 ? _txwdProbeMs : WCB_TXWD_RETRY_MS);
+        return;
+    }
+
+    if ((long)(now - _txwdNextMs) < 0) return;
+    // An ACK within the interval already proves the mesh hears us (only while nothing is wrong).
+    const unsigned long proof = _txwdProofMs;
+    if (_txwdLevel == 0 && !_txwdMisses && proof && now - proof < _txwdProbeMs) {
+        _txwdNextMs = proof + _txwdProbeMs;
+        return;
+    }
+    if (!_txHaveJudge(now)) {                 // nobody to ask
+        _txwdMisses = 0;
+        _txwdNextMs = now + _txwdProbeMs;
+        return;
+    }
+    _sendWdpSolicit();
+    _txwdSentMs = now ? now : 1;
+    _txwdProbes++;
 }
