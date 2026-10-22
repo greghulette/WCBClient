@@ -31,15 +31,34 @@ and neighbour discovery, bulk transfer, and a raw-packet hook that OTA rides on.
    side alone makes boards flicker in and out of the roster.
 5. **Bump `version=` in `library.properties` on every behaviour change** and say what changed
    in the commit subject — that version is what appears in WDP adverts and in users' rosters,
-   and it is how a mismatch gets diagnosed in the field.
+   and it is how a mismatch gets diagnosed in the field. Keep `WCB_CLIENT_VERSION_NUM`
+   (`src/WCB_Client.h`) equal to it.
+6. **`src/WCB_ChanSyncWire.h` is a byte-identical copy of the WCB firmware's
+   `Code/WCB/WCB_ChanSyncWire.h`** — channel sync's wire format, leader ordering and every
+   decision (`judgeMove`, `shouldSearch`, `judgeSearch`), host-tested there by
+   `tests/chansync_wire_test.cpp`. Never edit it here alone: change the WCB copy, run its test,
+   copy it over (`git hash-object` of both must match). The library code around it is plumbing
+   only; re-deriving an ordering or a verdict here splits the fleet.
+7. **Off its channel the library is a visitor.** A channel-sync search sets `_csOffHome`, and
+   while it is set `update()` returns after `_csTick()`, `_espSend()` refuses every frame but a
+   channel-sync one, and the receive path drops everything but a PROBE_REPLY. Anything new that
+   sends from `update()` sits below that early return; anything that sends from elsewhere goes
+   through `_espSend()`. A frame sent on a channel being visited introduces this device to a
+   group it is not part of. Channel-sync frames (types 25-27) also never refresh presence
+   (`_csHeardMs`): a visiting prober must not count as a member of the group it visits.
 
 ## Verifying
 
 No test suite. The checks are:
 
 ```bash
-# Compile the examples against the ESP32 core baseline (esp32:esp32@3.3.4)
-arduino-cli compile --fqbn esp32:esp32:esp32s3 examples/AllFeatures
+# Compile the examples against the ESP32 core baseline (esp32:esp32@3.3.4). The sketchbook's
+# WCB_Client shadows this repo: pass --library <this repo> and check the "Using library
+# WCB_Client ... in folder:" line names it. A private --build-path keeps the cache to yourself.
+arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . --build-path .build/all examples/AllFeatures
+
+# The channel-sync header must be the WCB firmware's file, byte for byte (rule 6):
+git hash-object src/WCB_ChanSyncWire.h   # == the WCB repo's Code/WCB/WCB_ChanSyncWire.h
 ```
 
 Real verification is on hardware, with at least one actual WCB present — mesh behaviour
@@ -50,24 +69,27 @@ change has only been compiled.
 
 | File | What |
 |---|---|
-| `src/WCB_Client.{h,cpp}` | the library — join, send, receive, WDP, heartbeats, bulk |
+| `src/WCB_Client.{h,cpp}` | the library — join, send, receive, WDP, heartbeats, bulk, channel sync (the `_cs*` section at the end of the .cpp) |
+| `src/WCB_ChanSyncWire.h` | channel sync wire format + decisions — the WCB firmware's file, byte-identical (rule 6) |
 | `src/WCBStream.{h,cpp}` | `Stream` adapter that forwards raw bytes (Maestro packets) over the mesh |
-| `examples/` | one per capability — `AllFeatures` is the broadest |
+| `src/WCB_Mgmt.h` | `WcbMgmt`: makes a host the Wizard's management relay (NaviCore) |
+| `examples/` | one per capability — `AllFeatures` is the broadest; `MgmtRelay` is a product in its own right (WebSocket with a login token, channel persistence) |
 
 Key entry points: `setIdentity()` (WDP advert — name + firmware), `setPortLabel()` (per-serial
 -port labels the Wizard displays), `setMaestroIds()` (which Maestros this device hosts),
 `enableSpecialPeer()` (out-of-band peer such as NaviCore), `onNeighbor()`/`getNeighbor()`
 (consume adverts), `onRawPacket()`/`sendRawPacket()` (custom protocols, e.g. OTA),
 `requestSequenceNames()`/`requestSequence()`/`saveSequence()` (read and write a WCB's
-stored sequences).
+stored sequences), `setChanSyncRank()`/`setRegion()`/`onChannelMove()`/`chanSyncMove()`
+(channel sync — design in the WCB repo's `docs/CHANNEL_SYNC.md`, summary in the README).
 
 Auto-join is **on by default**: the device registers WCBs it hears as peers and remembers
 them across reboots, so `wcb_quantity` does not need to cover the fleet.
 
-**Two callback families deliberately break rule 2** — the bulk-transfer hooks and
-`onSequenceNames()` fire from `update()` on the **loop** task, precisely so consumers can do
-flash I/O and allocation inside them. Both say so in the header; state the calling context
-explicitly on anything new, either way.
+**Some callbacks deliberately break rule 2** — the bulk-transfer hooks, `onSequenceNames()`,
+`onTxStall()` and `onChannelMove()` fire from `update()` on the **loop** task, precisely so
+consumers can do flash I/O (and, for the last two, decide on a restart) inside them. Each says
+so in the header; state the calling context explicitly on anything new, either way.
 
 **Sequence reads are one at a time, on purpose.** `requestSequenceNames()` returns names
 only; `requestSequence()` returns ONE value by key. There is deliberately no "fetch every

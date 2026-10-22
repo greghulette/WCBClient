@@ -36,6 +36,24 @@
 //  sketch keeps working on a plain ESP32 with no PSRAM. Keep the two in step: a
 //  line this transport accepts but the USB path would reject is a silent
 //  divergence between two mouths that are supposed to be identical.
+//
+//  ── THE LOGIN TOKEN (WCB_Client 1.19.0 example) ─────────────────────────────
+//  The same protocol as a WCB's WebSocket and NaviCore's, so Intellex logs in to
+//  all three the same way. With a token set (setToken), a session opens with the
+//  line "[AUTH:REQUIRED]", is left out of the console mirror, and every line it
+//  sends other than "?AUTH,<token>" is dropped unrun and answered "[AUTH:REQUIRED]".
+//  "?AUTH,<token>" is compared in constant time: a match answers "[AUTH:OK]" and the
+//  session is in for its lifetime (mirror on, commands run); a mismatch answers
+//  "[AUTH:FAIL]", the session is closed once that line is out, and for 1 s after
+//  any failure every ?AUTH on any session fails - one guess a second. With no token,
+//  nothing is sent on open and "?AUTH,<anything>" answers "[AUTH:OK]", so a client
+//  can always send it. A token set, changed or cleared applies to NEW sessions; one
+//  already logged in keeps going.
+//  The check runs here on the httpd task, inside feed(): it is a string compare,
+//  and doing it before the queue means a line from a session that has not logged in
+//  never reaches relaySerialLine() at all. The [AUTH:...] replies are owed per
+//  session (WsAcc::notes) and sent by pump() on the loop task, the one place that
+//  writes to the sockets.
 // =============================================================================
 #pragma once
 
@@ -70,6 +88,57 @@ static const size_t   WS_LINE_MAX        = 384;
 // Output staging. Big enough to hold a burst of mesh lines between pump() calls
 // without flushing mid-loop; small enough that one flush is ~one TCP segment.
 static const size_t   WS_SINK_BUF        = 2048;
+// Login token (see the header note). 8-32 characters; the sketch validates it.
+static const size_t   WS_TOKEN_MAX       = 32;
+static const uint32_t AUTH_LOCKOUT_MS    = 1000;   // every ?AUTH fails this long after a failure
+enum : uint8_t { NOTE_REQUIRED = 0x01, NOTE_OK = 0x02, NOTE_FAIL = 0x04 };   // WsAcc::notes
+
+// The token is written on the loop task (setToken) and read on the httpd task, so a
+// copy is taken under this lock. The same lock guards each session's fd, notes and
+// closing flag, which the httpd task sets and pump() reads on the loop task.
+inline portMUX_TYPE authMux = portMUX_INITIALIZER_UNLOCKED;
+inline char         authToken[WS_TOKEN_MAX + 1] = "";   // "" = no token
+inline uint32_t     authFailMs = 0;                      // httpd task only: the last failed ?AUTH
+
+// "" or nullptr = no token. Takes effect for the next session that opens.
+inline void setToken(const char* t) {
+  portENTER_CRITICAL(&authMux);
+  strlcpy(authToken, t ? t : "", sizeof(authToken));
+  portEXIT_CRITICAL(&authMux);
+}
+inline void tokenCopy(char* out) {   // out: WS_TOKEN_MAX + 1 bytes
+  portENTER_CRITICAL(&authMux);
+  memcpy(out, authToken, WS_TOKEN_MAX + 1);
+  portEXIT_CRITICAL(&authMux);
+}
+
+// Constant time over the whole token length: the loop runs WS_TOKEN_MAX times and
+// never exits early, so how long a guess takes says nothing about how much of it was
+// right. (Its length is not secret enough to matter: 8-32 characters, and every
+// failure costs a second.)
+inline bool tokenEqual(const char* given, const char* token) {
+  const size_t lg = strnlen(given, WS_LINE_MAX), lt = strnlen(token, WS_TOKEN_MAX);
+  uint8_t diff = (uint8_t)(lg != lt);
+  for (size_t i = 0; i < WS_TOKEN_MAX; i++) {
+    const uint8_t g = i < lg ? (uint8_t)given[i] : 0, t = i < lt ? (uint8_t)token[i] : 0;
+    diff |= (uint8_t)(g ^ t);
+  }
+  return diff == 0;
+}
+
+// The token part of "?AUTH,<token>" (or "" for a bare "?AUTH"), case-insensitive
+// verb as everywhere on this console; nullptr for any other line.
+inline const char* authArg(const char* s) {
+  static const char k[] = "?auth";
+  for (int i = 0; i < 5; i++) {
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') c += 32;
+    if (c != k[i]) return nullptr;
+  }
+  if (s[5] == ',')  return s + 6;
+  if (s[5] == '\0') return s + 5;
+  return nullptr;
+}
 
 struct WsCmd {
   int  fd;                    // client socket, for the async reply
@@ -194,24 +263,83 @@ inline WsSink sink;
 // second client's command landing in that window destroys both. NaviCore reproduced
 // exactly this on hardware (two valid commands, zero replies). Eviction policy is
 // deliberately identical to WsSink::begin() so the two cannot drift.
+// It is also the SESSION: whether it has logged in, and the [AUTH:...] lines it is owed.
 struct WsAcc {
-  int    fd  = -1;
-  size_t len = 0;
-  bool   overrun = false;
-  char   buf[WS_LINE_MAX];
+  int     fd  = -1;                // authMux (pump() reads it on the loop task)
+  size_t  len = 0;
+  bool    overrun = false;
+  bool    authed  = false;         // httpd task only: may run commands and see the mirror
+  bool    closing = false;         // [AUTH:FAIL] owed or sent: everything else from it is dropped (authMux)
+  uint8_t notes   = 0;             // NOTE_* owed, sent by pump() (authMux)
+  char    buf[WS_LINE_MAX];
 };
 inline WsAcc accs[WS_MAX_CLIENTS];
 
 inline WsAcc* accFor(int fd) {
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) if (accs[i].fd == fd) return &accs[i];
-  for (int i = 0; i < WS_MAX_CLIENTS; i++)
-    if (accs[i].fd < 0) { accs[i].fd = fd; accs[i].len = 0; accs[i].overrun = false; return &accs[i]; }
-  accs[0].fd = fd; accs[0].len = 0; accs[0].overrun = false;   // full: evict the oldest
-  return &accs[0];
+  // A session that is not in the table yet is a new one: logged in only if there is no
+  // token to log in with (read before the lock - tokenCopy takes the same one).
+  char tok[WS_TOKEN_MAX + 1];
+  tokenCopy(tok);
+  WsAcc* a = nullptr;
+  portENTER_CRITICAL(&authMux);
+  for (int i = 0; i < WS_MAX_CLIENTS && !a; i++) if (accs[i].fd == fd) a = &accs[i];
+  if (!a) {
+    for (int i = 0; i < WS_MAX_CLIENTS && !a; i++) if (accs[i].fd < 0) a = &accs[i];
+    if (!a) a = &accs[0];          // full: evict the oldest
+    a->fd = fd; a->len = 0; a->overrun = false;
+    a->authed = !tok[0]; a->closing = false; a->notes = 0;
+  }
+  portEXIT_CRITICAL(&authMux);
+  return a;
 }
 inline void releaseAcc(int fd) {
+  portENTER_CRITICAL(&authMux);
   for (int i = 0; i < WS_MAX_CLIENTS; i++)
-    if (accs[i].fd == fd) { accs[i].fd = -1; accs[i].len = 0; accs[i].overrun = false; }
+    if (accs[i].fd == fd) {
+      accs[i].fd = -1; accs[i].len = 0; accs[i].overrun = false;
+      accs[i].authed = false; accs[i].closing = false; accs[i].notes = 0;
+    }
+  portEXIT_CRITICAL(&authMux);
+}
+inline void note(WsAcc* a, uint8_t bits) {
+  portENTER_CRITICAL(&authMux);
+  a->notes |= bits;
+  portEXIT_CRITICAL(&authMux);
+}
+inline bool isClosing(int fd) {   // loop task (drain)
+  bool c = false;
+  portENTER_CRITICAL(&authMux);
+  for (int i = 0; i < WS_MAX_CLIENTS; i++) if (accs[i].fd == fd && accs[i].closing) c = true;
+  portEXIT_CRITICAL(&authMux);
+  return c;
+}
+
+// "?AUTH,<given>" from session `a` (httpd task).
+inline void authLine(WsAcc* a, const char* given) {
+  char tok[WS_TOKEN_MAX + 1];
+  tokenCopy(tok);
+  if (!tok[0]) {                   // no token: always OK, so a client can always send it
+    a->authed = true;
+    sink.begin(a->fd);
+    note(a, NOTE_OK);
+    return;
+  }
+  const uint32_t now    = millis();
+  const bool     locked = authFailMs && (now - authFailMs) < AUTH_LOCKOUT_MS;
+  const bool     match  = tokenEqual(given, tok);   // compared even when locked: the same work either way
+  if (match && !locked) {
+    a->authed = true;
+    sink.begin(a->fd);
+    note(a, NOTE_OK);
+    return;
+  }
+  authFailMs = now ? now : 1;      // any failure locks every session out for AUTH_LOCKOUT_MS
+  a->authed  = false;
+  sink.drop(a->fd);
+  portENTER_CRITICAL(&authMux);
+  a->notes  |= NOTE_FAIL;          // pump() sends it, then closes the session
+  a->closing = true;
+  portEXIT_CRITICAL(&authMux);
 }
 
 // Feed one received byte into a client's accumulator; enqueue on newline.
@@ -220,10 +348,16 @@ inline void feed(WsAcc* a, int fd, char c) {
     if (a->overrun)  { a->overrun = false; a->len = 0; return; }   // drop the WHOLE line
     if (!a->len)     return;                                       // blank line
     a->buf[a->len] = '\0';
+    const size_t n = a->len;
+    a->len = 0;
+    if (a->closing) return;                                        // failed its login: closing
+    // The login, before anything can run. ?AUTH is never queued: it means nothing to
+    // the relay itself, and on the USB port it is a no-op (relaySerialLine ignores it).
+    if (const char* given = authArg(a->buf)) { authLine(a, given); return; }
+    if (!a->authed) { note(a, NOTE_REQUIRED); return; }            // dropped unrun
     WsCmd cmd;
     cmd.fd = fd;
-    memcpy(cmd.line, a->buf, a->len + 1);
-    a->len = 0;
+    memcpy(cmd.line, a->buf, n + 1);
     if (!wsQueue) return;
     // Backpressure, not silent loss — see WS_ENQUEUE_WAIT_MS.
     if (xQueueSend(wsQueue, &cmd, pdMS_TO_TICKS(WS_ENQUEUE_WAIT_MS)) != pdTRUE)
@@ -245,9 +379,11 @@ inline void feed(WsAcc* a, int fd, char c) {
 // ── httpd handler (Core 0 — copy, enqueue, return) ──────────────────────────
 inline esp_err_t wsHandler(httpd_req_t* req) {
   const int fd = httpd_req_to_sockfd(req);
-  if (req->method == HTTP_GET) {          // handshake completed
-    sink.begin(fd);
-    accFor(fd);
+  if (req->method == HTTP_GET) {          // handshake completed: a NEW session
+    releaseAcc(fd);                       // nothing carries over from an earlier socket on this fd
+    WsAcc* a = accFor(fd);
+    if (a->authed) sink.begin(fd);        // no token: exactly as before
+    else           note(a, NOTE_REQUIRED);
     return ESP_OK;
   }
 
@@ -279,9 +415,10 @@ inline esp_err_t wsHandler(httpd_req_t* req) {
   if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
 
   // Re-arm the sink on traffic: a client that was evicted while another connected
-  // would otherwise stay silent.
-  sink.begin(fd);
+  // would otherwise stay silent. Only a logged-in session: no mirror before the login.
   WsAcc* a = accFor(fd);
+  if (a->closing) return ESP_OK;          // failed its login: nothing more is read from it
+  if (a->authed) sink.begin(fd);
   for (size_t i = 0; i < frame.len; i++) feed(a, fd, (char)buf[i]);
   return ESP_OK;
 }
@@ -334,10 +471,42 @@ inline void drain() {
   if (!wsQueue) return;
   WsCmd cmd;
   if (xQueueReceive(wsQueue, &cmd, 0) != pdTRUE) return;
-  sink.begin(cmd.fd);            // ensure the reply reaches the client that asked
+  // Only a logged-in session's lines are queued. One that failed a later ?AUTH is
+  // closing: what it queued before still runs, but it is not put back on the mirror.
+  if (!isClosing(cmd.fd)) sink.begin(cmd.fd);   // ensure the reply reaches the client that asked
   relaySerialLine(cmd.line);
 }
 
-inline void pump() { sink.pump(); }
+// One line to one session, outside the mirror: the [AUTH:...] replies.
+inline void sendTo(int fd, const char* line) {
+  httpd_ws_frame_t f = {};
+  f.final   = true;
+  f.type    = HTTPD_WS_TYPE_TEXT;
+  f.payload = (uint8_t*)line;
+  f.len     = strlen(line);
+  httpd_ws_send_frame_async(wsServer, fd, &f);
+}
+
+// The [AUTH:...] lines each session is owed, then the mirror. A [AUTH:FAIL] is sent
+// and then the session is closed: httpd_sess_trigger_close() queues the close on the
+// httpd task, behind the frame this task has just written.
+inline void pumpNotes() {
+  if (!wsServer) return;
+  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+    int     fd;
+    uint8_t n;
+    portENTER_CRITICAL(&authMux);
+    fd = accs[i].fd;
+    n  = accs[i].notes;
+    accs[i].notes = 0;
+    portEXIT_CRITICAL(&authMux);
+    if (fd < 0 || !n) continue;
+    if (n & NOTE_REQUIRED) sendTo(fd, "[AUTH:REQUIRED]\n");
+    if (n & NOTE_OK)       sendTo(fd, "[AUTH:OK]\n");
+    if (n & NOTE_FAIL)   { sendTo(fd, "[AUTH:FAIL]\n"); httpd_sess_trigger_close(wsServer, fd); }
+  }
+}
+
+inline void pump() { pumpNotes(); sink.pump(); }
 
 }  // namespace mgmtws

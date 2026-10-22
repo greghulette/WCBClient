@@ -4,6 +4,7 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <atomic>
+#include "WCB_ChanSyncWire.h"   // channel sync wire format + decisions; byte-identical to the WCB firmware's copy
 
 // Forward declaration — WCBStream is defined in WCBStream.h.
 // Keeps this header self-contained; users include WCBStream.h only when needed.
@@ -76,11 +77,12 @@ constexpr uint8_t broadcast = 0;
 // Library limits
 // ─────────────────────────────────────────────────────────────────────────────
 #define WCB_MAX_BOARDS   20   // Maximum WCB IDs supported (1–20)
-#define WCB_MESH_CHANNEL  1   // Default ESP-NOW mesh channel (1–11). The ESP32 has ONE
-                              // radio, so this MUST match the channel every WCB is on or
-                              // this device is silently unreachable. If your fleet runs on
-                              // a non-default channel (set via ?WCBCH / the Wizard), call
-                              // setMeshChannel(ch) before begin() to match it.
+#define WCB_MESH_CHANNEL  1   // Default ESP-NOW mesh channel (1–11; 12-13 need setRegion()).
+                              // The ESP32 has ONE radio, so this MUST match the channel
+                              // every WCB is on or this device is silently unreachable
+                              // (channel sync, 1.19.0, finds the mesh again; see below).
+                              // If your fleet runs on a non-default channel (set via ?WCBCH
+                              // / the Wizard), call setMeshChannel(ch) before begin().
 #define WCB_PENDING_MAX  10   // In-flight COMMAND slots tracked for ACK.
                               // Matches the WCB firmware's ETM_PENDING_MAX so
                               // client ensured traffic has the same depth as
@@ -124,8 +126,15 @@ constexpr uint8_t broadcast = 0;
 #define WCB_TXWD_RELAPSE_MS 180000UL  // a stall this soon after a recovery skips level 1 (the restart did not hold)
 
 // The library's version as a number - major*10000 + minor*100 + patch - kept equal to library.properties, so a
-// consumer can refuse to build against one too old: #if WCB_CLIENT_VERSION_NUM < 11801 ... #error ... #endif
-#define WCB_CLIENT_VERSION_NUM 11801
+// consumer can refuse to build against one too old: #if WCB_CLIENT_VERSION_NUM < 11900 ... #error ... #endif
+#define WCB_CLIENT_VERSION_NUM 11900
+
+// ── Channel sync (1.19.0) ────────────────────────────────────────────────────
+// Design: WCB repo docs/CHANNEL_SYNC.md. Wire format and every decision: WCB_ChanSyncWire.h
+// (namespace chansync), the same file the WCB firmware compiles. These are the library's own.
+#define WCB_CHSYNC_QUIET_MS   3000UL  // a search waits this long after the last command / raw packet in or out
+#define WCB_CHSYNC_DEDUP_MS   5000UL  // a MOVE's moveId is remembered this long (its 5 frames span 1.2 s)
+#define WCB_CHSYNC_SETTLE_MS   150UL  // after a pull's last frame, before leaving that channel (ESP-NOW sends are queued)
 
 // ── Ensured-delivery (ETM) retransmit tuning ─────────────────────────────────
 // Applies ONLY to send()/broadcast() calls made with ensured=true. These values
@@ -422,6 +431,14 @@ struct WCBNeighbor {
     // the TLV); it does NOT mean "no sequences", because an EMPTY inventory hashes
     // to the FNV-1a basis 0x811C9DC5.
     uint32_t      seqHash;
+    // Channel sync facts (WDP TLV 0x14 CHAN, 1.19.0). chanValid false = its latest advert carried
+    // no CHAN TLV (firmware older than channel sync): channel sync then derives its key - a WCB's
+    // rank is its number, a client's 100 + id, unpinned, sync off (docs/CHANNEL_SYNC.md §2).
+    bool          chanValid;
+    uint8_t       chanChannel;       // the channel it says it is on
+    uint8_t       chanRank;          // its leader rank (chansync::RANK_*; lower leads)
+    uint8_t       chanFlags;         // chansync::F_PINNED / chansync::F_SYNC
+    char          chanCc[3];         // its region ("01", "DE", ...)
     unsigned long lastSeenMs;        // millis() of the last advert heard
 };
 
@@ -465,6 +482,20 @@ struct WCBTxWatchStatus {
     uint32_t sendErrors;    // esp_now_send() calls that returned an error, all senders
     uint32_t sinceProofMs;  // ms since the mesh last showed it hears this device; 0xFFFFFFFF = never
 };
+
+// ── Channel sync (1.19.0, onChannelMove) ─────────────────────────────────────
+// Called ONCE when a MOVE this device accepted - or one it announced itself (its
+// own search, or chanSyncMove) - reaches its switch time. Runs from update(), the
+// LOOP task, so NVS writes are safe inside it.
+//   channel : the mesh's new channel. Persist it either way, so the next boot
+//             starts there (setMeshChannel() before begin()).
+// Return true if the host applies the move itself: a SoftAP moves only by
+// restarting, so save, then restart from the host's own loop - never from inside
+// this callback. The library then leaves the radio alone.
+// Return false and the library switches the radio live (esp_wifi_set_channel) -
+// possible only with no SoftAP up. With a SoftAP up and no callback (or false),
+// the library logs that it cannot move and stays.
+typedef bool (*WCBChannelMoveCallback)(uint8_t channel);
 
 // Called for any received ESP-NOW packet whose size is NOT the standard
 // wcb_packet_etm_t (252 B) — e.g. an application layer's own structs (the
@@ -837,6 +868,110 @@ public:
     // RAM only. Never call it in a shipping sketch.
     void debugTxWedge(uint8_t mode);
 
+    // ── Channel sync (1.19.0) ──────────────────────────────────────────────────
+    //
+    // The ESP32 has one radio, so every board, every client and any access point
+    // one of them hosts share ONE channel; a device on another channel hears
+    // nothing and nobody hears it. Channel sync keeps the whole mesh on one
+    // channel when it moves, and brings strays back. Design: WCB repo
+    // docs/CHANNEL_SYNC.md. Wire format and decisions: WCB_ChanSyncWire.h, the
+    // file the WCB firmware compiles too, so both sides judge the same way.
+    //
+    // WHO LEADS. Every device has a key (id, rank, pinned). The best key present
+    // leads (chansync::better): a device that can lead beats one that cannot
+    // (rank 255), a pinned one (a WCB joined to an access point) beats an unpinned
+    // one, then the lower rank, then the lower id. WCB n has rank n; NaviCore sets
+    // 0; any other client defaults to 100 + its device id. A WCB_Client device is
+    // never pinned. Advertised in WDP TLV 0x14 CHAN, so CALL setIdentity(): a
+    // device that sends no advert gets a derived key on the WCBs, as a WCB would.
+    //
+    // MOVE (ETM packet type 25). The leader broadcasts "the mesh moves to channel
+    // N" 5 times, 300 ms apart, switching 1.5 s after the first; every frame carries
+    // the time left. A follower acts on the first frame of a move and obeys
+    // (chansync::judgeMove) unless sync is off here, the channel is outside this
+    // device's region, it is already there, or a device this one hears outranks the
+    // sender. At the switch, onChannelMove() decides how it is applied.
+    //
+    // SEARCH (PROBE 26 / REPLY 27). A device that leads its group (nobody it hears
+    // outranks it) and misses a board it knows - a floor peer (1..wcb_quantity), a
+    // learned peer or the special peer, offline by the heartbeat sweep (50 s);
+    // temporary and rank-255 devices are never missed - visits every other channel
+    // its region allows: switch, broadcast a PROBE, listen 150 ms. Then it either
+    // takes its group to a better leader it found (a MOVE at home) or visits each
+    // worse group and sends it a MOVE home (3 frames, 100 ms apart, 600 ms). Not
+    // before 40 s after boot, only once the condition has held 10 s, then attempts
+    // at 0, 1, 2, 4, 8, 16 and 32 minutes. A search waits until it can hop (no
+    // SoftAP stations connected, no STA association) and the device is quiet: no
+    // ensured send outstanding, no fragmented send, bulk transfer or sequence
+    // request in flight, no transmit-watchdog probe out, and no command or raw
+    // packet in or out for WCB_CHSYNC_QUIET_MS. While it is off its own channel
+    // (about 1.5-2 s) update() sends nothing else - no heartbeat, advert, retry or
+    // watchdog probe - every send from the app returns false, and every received
+    // frame except a REPLY is dropped. Every device with sync on answers a PROBE,
+    // after (id % 16) x 3 ms, naming the best device it hears.
+    //
+    // All the radio work happens in update(), on the loop task. The ESP-NOW receive
+    // callback only copies the frames; nothing is decided, sent or printed there.
+    // Like WDP, these frames ride the ETM struct, so the WCBs need ETM on.
+
+    // Leader rank, 0-255 (lower leads). Default 100 + device id. NaviCore uses 0;
+    // chansync::RANK_NEVER (255) never leads or searches (a management relay) but
+    // still follows. Call before begin() (a later call takes effect at the next advert).
+    void    setChanSyncRank(uint8_t rank);
+    uint8_t chanSyncRank() const;
+
+    // Take part or not. Default on. Live: off cancels a pending move and ends a
+    // search (back home). The host persists it. Off behaves exactly as before 1.19.0:
+    // never moves, never searches, never answers a PROBE.
+    void    setChanSyncEnabled(bool on);
+    bool    chanSyncEnabled() const { return _csEnabled; }
+
+    // Region (channels 12-13). Call before begin(): "01" (default, world safe, 1-11)
+    // or an ESP-IDF country code - AT AU BE BG BR CA CH CN CY CZ DE DK EE ES FI FR GB
+    // GR HK HR HU IE IN IS IT JP KR LI LT LU LV MT MX NL NO NZ PL PT RO SE SI SK TW US.
+    // Anything else is refused (logged) and the previous region kept. begin() applies
+    // it after WiFi starts and before the channel is set, with 802.11d off
+    // (esp_wifi_set_country_code(cc, false)) so a STA association cannot change it.
+    // "01" makes no call - unless the WiFi driver restored another region from flash
+    // (the IDF stores the country there), which "01" then resets to the IDF default.
+    // If WiFi is already started when this is called (a SoftAP raised before begin()),
+    // it is applied at once too, so raise the AP AFTER this call to put it on 12-13.
+    // Legality is the operator's call: 12-13 are legal in Europe and most of the
+    // world; WiFi devices in the US are limited to 1-11.
+    void        setRegion(const char* cc);
+    const char* region() const { return _csRegion; }
+
+    // The region's top channel, capped at 13 (from esp_wifi_get_country after begin();
+    // before it, 11 for "01" and 13 for any other region).
+    uint8_t maxChannel() const;
+
+    // The mesh channel this device is on now (during a search: the channel it will
+    // return to).
+    uint8_t currentChannel() const;
+
+    // Register the move callback (see WCBChannelMoveCallback). Loop task.
+    void    onChannelMove(WCBChannelMoveCallback cb) { _csMoveCb = cb; }
+
+    // Run one search now (when the device is quiet, within 30 s), if it can hop and
+    // leads its group - a device it hears that outranks it is the one to search: the
+    // findings are weighed against the searcher. Logs why not. Restarts the attempt
+    // schedule. A rank-255 device (never leads) can search only while it hears nobody,
+    // which is how a stranded relay finds the mesh again.
+    void    chanSyncSearchNow();
+
+    // Operator move of the whole mesh to `channel`: a MOVE with the OPERATOR flag,
+    // which every unpinned follower obeys whoever sent it; this device moves with it.
+    // Refused (false, and *why says why) when: not started, sync off, the channel is
+    // outside 1..maxChannel() or is the current one, a move or search is already
+    // running, a SoftAP is up and no onChannelMove() is registered (this device could
+    // not follow), or a PINNED device is heard - it would stay, the mesh would go, and
+    // searching would bring everyone back.
+    bool    chanSyncMove(uint8_t channel, String* why = nullptr);
+
+    // Human-readable state, then one machine line:
+    // [CHSYNC:EN=,CH=,MAXCH=,CC=,RANK=,PIN=,LEAD=,LRANK=,LPIN=,STATE=idle|search|move]
+    void    printChanSyncStatus(Print& out);
+
     // ── Callbacks ────────────────────────────────────────────────────────────
 
     // Register or replace the command callback after construction.
@@ -1052,13 +1187,17 @@ public:
     // Note: enabling checksum reduces the usable command length from 200 to ~188 chars.
     void setChecksum(bool enabled);
 
-    // Set the ESP-NOW mesh channel this device expects the WCBs to be on (1–11).
+    // Set the ESP-NOW mesh channel this device expects the WCBs to be on
+    // (1..maxChannel(): 1-11 in the default region "01", up to 13 after setRegion()).
     // The ESP32 has one radio, so this device can only hear the mesh if it sits on
     // the same channel. Best called BEFORE begin() if your fleet runs on a
-    // non-default channel (changed via ?WCBCH / the Wizard). Calling it AFTER
-    // begin() also works when no SoftAP is active — it re-pins the radio live.
-    // With a SoftAP active (which owns the channel) begin() and update() instead
-    // WARN if the radio ends up on the wrong channel. Default: WCB_MESH_CHANNEL (1).
+    // non-default channel (changed via ?WCBCH / the Wizard) - and with channel sync,
+    // pass the channel onChannelMove() last persisted. Before begin() a channel up to
+    // 13 is accepted for a non-"01" region and re-checked by begin() against the
+    // region's real range (out of range: a warning, and WCB_MESH_CHANNEL instead).
+    // Calling it AFTER begin() also works when no SoftAP is active — it re-pins the
+    // radio live. With a SoftAP active (which owns the channel) begin() and update()
+    // instead WARN if the radio ends up on the wrong channel. Default: WCB_MESH_CHANNEL (1).
     void setMeshChannel(uint8_t channel);
 
     // ── Device identity (WDP discovery) ────────────────────────────────────
@@ -1211,13 +1350,118 @@ private:
     volatile uint8_t       _txWedge      = 0;   // debugTxWedge: 0 off, 1 until an ESP-NOW restart, 2 until reboot
     WCBTxStallCallback     _txStallCb    = nullptr;
 
-    esp_err_t _espSend(const uint8_t* mac, const uint8_t* data, size_t len);   // EVERY send goes through here
+    esp_err_t _espSend(const uint8_t* mac, const uint8_t* data, size_t len);   // EVERY send goes through here...
+    esp_err_t _espSendRaw(const uint8_t* mac, const uint8_t* data, size_t len); // ...and this, which channel sync
+                                                                                // uses off the home channel
     void      _txWatchTick(unsigned long now);
     uint8_t   _txJudges(unsigned long now) const;   // boards heard lately that have advertised before
     void      _txWatchAnswered(unsigned long now);
     void      _txWatchLevel(uint8_t level, unsigned long now);
     void      _sendWdpSolicit();
     void      _restartEspNow();
+
+    // ── Channel sync (1.19.0) ────────────────────────────────────────────────
+    // Threads: the RX task (ESP-NOW receive callback) only COPIES - a frame into
+    // _csRing, a presence stamp into _csHeardMs, a neighbor's CHAN facts into
+    // _csPeer - and reads _csOffHome. Everything else, every decision, send and
+    // print, runs on the loop task in _csTick() from update().
+    bool                   _csEnabled    = true;
+    bool                   _csRankSet    = false;   // false: 100 + device id
+    uint8_t                _csRank       = 0;
+    char                   _csRegion[3]  = "01";
+    uint8_t                _csMaxCh      = 11;      // the region's top channel (begin())
+    WCBChannelMoveCallback _csMoveCb     = nullptr;
+    unsigned long          _csBootMs     = 0;       // begin(): the search's boot grace runs from here
+
+    // Presence: millis() a device was last heard by any frame except a channel-sync
+    // one (a visiting prober is not a member of this channel's group). One aligned
+    // word per slot, written on the RX task, read on the loop task. Reset when this
+    // device changes channel: what it heard was heard on the old one.
+    volatile unsigned long _csHeardMs[WCB_MAX_BOARDS] = {};
+    // Each neighbor's CHAN TLV, from its latest advert. Guarded by _csMux (RX writes, loop reads).
+    struct CsPeer { bool has; chansync::ChanFacts f; };
+    CsPeer                 _csPeer[WCB_MAX_BOARDS] = {};
+    mutable portMUX_TYPE   _csMux = portMUX_INITIALIZER_UNLOCKED;   // mutable: the const key readers take it
+
+    // RX -> loop hand-off ring for packet types 25-27, guarded by _csMux.
+    struct CsFrame { uint8_t type; uint8_t sender; uint8_t data[16]; unsigned long rxMs; };
+    static constexpr uint8_t CS_RING = 8;
+    CsFrame                _csRing[CS_RING];
+    uint8_t                _csHead = 0, _csTail = 0;
+
+    // Off the home channel (a search visit or a pull): the RX task drops everything
+    // but a REPLY, and _espSend() refuses every frame but a channel-sync one.
+    volatile bool          _csOffHome    = false;
+    volatile unsigned long _csBusyMs     = 0;       // last command / raw packet in or out (WCB_CHSYNC_QUIET_MS)
+
+    // A pending switch: a MOVE this device accepted, or announced itself.
+    bool          _csMovePending = false;
+    uint8_t       _csMoveCh      = 0;
+    unsigned long _csMoveAtMs    = 0;       // when to switch
+    // MOVE frames this device is sending (an announce at home, or a pull abroad).
+    uint8_t       _csAnnLeft     = 0;
+    unsigned long _csAnnNextMs   = 0;
+    uint16_t      _csAnnGapMs    = 0;
+    uint16_t      _csAnnId       = 0;
+    uint8_t       _csAnnCh       = 0;       // the channel the frames move the mesh to
+    uint8_t       _csAnnFlags    = 0;
+    unsigned long _csAnnSwitchMs = 0;       // the switch time the frames count down to
+    // First-frame-only: the last move acted on (or refused).
+    uint8_t       _csSeenSender  = 0;
+    uint16_t      _csSeenMoveId  = 0;
+    unsigned long _csSeenMs      = 0;
+    // A REPLY owed to a PROBE, sent after this device's jitter.
+    bool          _csReplyPending = false;
+    uint16_t      _csReplyNonce   = 0;
+    uint8_t       _csReplyProber  = 0;      // left out of the REPLY's best: a visitor is not this group's member
+    unsigned long _csReplyDueMs   = 0;
+
+    // Search.
+    enum : uint8_t { CS_SEARCH_IDLE = 0, CS_SEARCH_VISIT, CS_SEARCH_PULL };
+    uint8_t       _csSearch      = CS_SEARCH_IDLE;
+    uint8_t       _csHomeCh      = 0;
+    uint16_t      _csNonce       = 0;
+    uint8_t       _csVisitCh     = 0;       // channel being visited / pulled (0 = about to pick the next)
+    unsigned long _csDwellEndMs  = 0;
+    chansync::Key _csFound[chansync::MAX_CHANNEL_CAP + 1];
+    uint8_t       _csPullMask[chansync::MAX_CHANNEL_CAP + 1] = {};
+    bool          _csSearchNowReq = false;  // chanSyncSearchNow(): run one when quiet...
+    unsigned long _csSearchNowMs  = 0;      // ...asked at this time; given up after MOVE_DEFER_MAX_MS of no quiet
+    // The attempt schedule (chansync::searchAttemptOffsetMs).
+    unsigned long _csTrigSinceMs = 0;       // the search condition has held since (0 = not holding)
+    unsigned long _csTrigArmMs   = 0;       // ...and held TRIGGER_STABLE_MS: attempts count from here
+    uint8_t       _csAttempt     = 0;       // next attempt; SEARCH_ATTEMPTS = done until re-armed
+    unsigned long _csLastEvalMs  = 0;
+    uint32_t      _csSearches    = 0;
+
+    void          _csReset();                         // begin(): fresh state
+    void          _csTick(unsigned long now);         // update(): the whole state machine
+    void          _csRxFrame(uint8_t type, uint8_t sender, const char* payload);   // RX task: copy only
+    bool          _csPop(CsFrame& out);
+    void          _csHandleFrame(const CsFrame& f, unsigned long now);
+    void          _csHandleMove(const CsFrame& f, unsigned long now);
+    chansync::Key _csSelfKey() const;
+    chansync::Key _csKeyOf(uint8_t id) const;          // a neighbor's key: its TLV, else derived
+    bool          _csHeard(uint8_t id, unsigned long now) const;
+    chansync::Key _csBestPresent(unsigned long now, uint8_t exclude = 0) const;
+    bool          _csMemberMissing(unsigned long now, uint8_t* who = nullptr) const;
+    bool          _csCanHop(const char** why = nullptr) const;
+    bool          _csQuiet(unsigned long now, const char** why = nullptr);
+    bool          _csSoftApUp() const;
+    bool          _csSetRadio(uint8_t ch);             // esp_wifi_set_channel, logged on failure
+    void          _csStartSearch(unsigned long now, bool manual, uint8_t missingId);
+    void          _csSearchStep(unsigned long now);
+    void          _csSearchDone(unsigned long now);
+    void          _csGoHome();
+    void          _csStartFrames(uint8_t toCh, uint8_t flags, uint8_t repeats, uint16_t gapMs,
+                                 uint16_t countdownMs, unsigned long now);
+    void          _csSendMoveFrame(unsigned long now);
+    void          _csSendFrame(uint8_t type, const uint8_t* payload, int len);
+    void          _csApplyMove(uint8_t ch, unsigned long now);
+    void          _csArrived(uint8_t ch, unsigned long now);   // this device is now on ch for good
+    void          _csNoteBusy() { unsigned long t = millis(); _csBusyMs = t ? t : 1; }
+    void          _csApplyRegion();                    // after WiFi init, before the channel is set
+    uint8_t       _csReadMaxCh() const;
 
     // ── WDP device-identity advert ───────────────────────────────────────────
     // Set via setIdentity(); broadcast on the mesh as WCB_PACKET_WDP so WCBs

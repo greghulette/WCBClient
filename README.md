@@ -77,6 +77,12 @@ associates with an access point, the channel is locked to that AP's channel and
 ESP-NOW only works if all peers happen to be on it too. Mismatched channels =
 packets silently dropped, no error.
 
+Since 1.19.0, **channel sync** keeps the mesh together when it moves: the device that
+leads announces the new channel and everyone switches with it, and a group leader that
+misses a board looks for it on the other channels. Your sketch's part is to start on
+the channel it was last moved to and to save a move when one happens — see
+[Channel sync](#channel-sync-1190).
+
 ### The WiFi MAC is overwritten
 
 `begin()` calls `esp_wifi_set_mac()` to force the station MAC to the WCB scheme
@@ -111,7 +117,7 @@ miss ESP-NOW packets. Disable it with `esp_wifi_set_ps(WIFI_PS_NONE)` (or
 | If you need… | Result with this library |
 |---|---|
 | WCB ESP-NOW only | ✅ Intended use — works out of the box |
-| SoftAP (hosted web UI) + WCB on the same board | ✅ Supported — `begin()` preserves an existing/later SoftAP as `WIFI_AP_STA`. The AP owns the single radio's channel, so bring it up on the mesh channel (`WiFi.softAP(ssid, pass, 1)`); the library **warns** (never force-moves it) if the radio ends up elsewhere. Match a non-default fleet channel with `setMeshChannel()`. |
+| SoftAP (hosted web UI) + WCB on the same board | ✅ Supported — `begin()` preserves an existing/later SoftAP as `WIFI_AP_STA`. The AP owns the single radio's channel, so bring it up on the mesh channel (`WiFi.softAP(ssid, pass, 1)`); the library **warns** (never force-moves it) if the radio ends up elsewhere. Match a non-default fleet channel with `setMeshChannel()`. When the mesh moves (channel sync), the library cannot move an AP live: register `onChannelMove()`, save the channel and restart. |
 | WiFi STA (associating with an external router) + WCB on the same board | ⚠️ Only if all peers share the router's fixed channel; `begin()` still disconnects STA |
 | A second, separate ESP-NOW network | ❌ Not supported — single global receive callback |
 | Multiple `WCB_Client` objects | ❌ Not supported — singleton |
@@ -249,7 +255,16 @@ void loop() {
 | `onCommand(callback)` | Register or replace the received-command callback. |
 | `onStatusChange(callback)` | Register or replace the online/offline status callback. |
 | `setChecksum(bool)` | Enable/disable CRC32 checksums. Must match `?ETM,CHKSM` setting on WCBs (default: on). |
-| `setMeshChannel(uint8_t)` | Set the ESP-NOW mesh channel (1–11) this device expects. Best called before `begin()` if your fleet runs on a non-default channel (set on the WCBs via `?WCBCH` / the Wizard); calling it after `begin()` also re-pins the radio live when no SoftAP is active. One radio = one channel (default: 1). |
+| `setMeshChannel(uint8_t)` | Set the ESP-NOW mesh channel (1–`maxChannel()`: 1-11 by default, 12-13 after `setRegion()`) this device expects. Best called before `begin()` with the channel you last saved from `onChannelMove()`, or the one the WCBs use (`?WCBCH` / the Wizard); calling it after `begin()` also re-pins the radio live when no SoftAP is active. One radio = one channel (default: 1). |
+| `setChanSyncRank(rank)` / `chanSyncRank()` | Channel sync leader rank (lower leads). Default 100 + device id; NaviCore uses 0; 255 never leads or searches but follows. Before `begin()`. |
+| `setChanSyncEnabled(bool)` / `chanSyncEnabled()` | Take part in channel sync (default on; live). Off = never moves, searches or answers a search. |
+| `setRegion(cc)` / `region()` | Radio region before `begin()`: `"01"` (default, channels 1-11) or an IDF country code such as `"DE"` for 12-13. |
+| `maxChannel()` | The region's top channel (≤ 13). |
+| `currentChannel()` | The mesh channel this device is on now. |
+| `onChannelMove(cb)` | `bool cb(uint8_t channel)`, on the loop task when a move reaches its switch time: persist `channel`; return `true` if the host applies it (a SoftAP restarts), `false` to let the library switch the radio live. |
+| `chanSyncSearchNow()` | One channel search now, if this device can hop and leads its group. |
+| `chanSyncMove(ch, [String* why])` | Operator move of the whole mesh; `false` and a reason when refused. |
+| `printChanSyncStatus(Print&)` | Status, ending in the `[CHSYNC:...]` machine line. |
 | `getPeerStats(wcbID)` | Delivery counters for one peer, by value. Out-of-range returns a zeroed struct. |
 | `getAggregateStats()` | Totals across all peers, computed on demand. |
 | `getBroadcastSent()` | Broadcast COMMAND frames put on the air. |
@@ -416,6 +431,12 @@ struct WCBNeighbor {
     uint8_t       maestroIds[9];  // this board's local Maestro IDs
     uint8_t       maestroCount;
     char          portLabels[5][25]; // advertised serial-port labels ("" = unlabeled)
+    uint32_t      seqHash;        // stored-sequence inventory fingerprint (TLV 0x13); 0 = not advertised
+    bool          chanValid;      // channel sync (TLV 0x14 CHAN, 1.19.0): false = older firmware
+    uint8_t       chanChannel;    //   the channel it says it is on
+    uint8_t       chanRank;       //   its leader rank (lower leads; 255 never leads)
+    uint8_t       chanFlags;      //   chansync::F_PINNED (joined to a network) / chansync::F_SYNC
+    char          chanCc[3];      //   its region ("01", "DE", ...)
     unsigned long lastSeenMs;     // millis() of the last advert heard
 };
 ```
@@ -634,6 +655,85 @@ void onTxStall(uint8_t level, uint32_t stalledMs) {
   never reaches the radio — until the watchdog's ESP-NOW restart (1) or until reboot (2).
   Never call it in a shipping sketch.
 
+### Channel sync (1.19.0)
+
+The ESP32 has one radio, so every board, every client and any access point one of them hosts
+share **one channel**; a device on another channel hears nothing, and nobody hears it.
+Channel sync moves the mesh together and brings strays back. It is on by default and needs
+nothing from a sketch that never moves — but a sketch should **start where the mesh last
+moved to** and **save a move** when one happens. The design is the WCB repo's
+`docs/CHANNEL_SYNC.md`; the wire format and every decision are in `src/WCB_ChanSyncWire.h`,
+a byte-identical copy of the file the WCB firmware compiles.
+
+```cpp
+wcb.setRegion("DE");                    // before begin(); default "01" (channels 1-11)
+wcb.setMeshChannel(savedChannel);       // where the last move left the mesh
+wcb.setChanSyncRank(0);                 // NaviCore only; default 100 + id, 255 = never lead
+wcb.onChannelMove([](uint8_t ch) {      // loop task (inside update())
+  saveChannel(ch);                      // persist it either way
+  return requestRestart();              // true: the host applies it (a SoftAP restarts)
+});                                     // false: the library switches the radio live
+wcb.begin();
+wcb.setIdentity("MyDevice", "1.0");     // the key travels in the WDP advert
+```
+
+- **Who leads.** Every device has a key: id, rank, pinned. A device that can lead beats one
+  that cannot (rank 255); a **pinned** device — a WCB joined to a WiFi network, whose access
+  point owns its channel — beats an unpinned one; then the lower rank; then the lower id. WCB
+  *n* has rank *n*, NaviCore 0, any other client 100 + id. A client is never pinned. The key is
+  advertised in WDP TLV `0x14` CHAN (`[channel][rank][flags][cc0][cc1]`) and decoded from every
+  neighbor into `WCBNeighbor::chan*`; a neighbor without it gets a derived key. **Call
+  `setIdentity()`**: a device that sends no advert is ranked by the WCBs as if it were a WCB.
+- **MOVE** (ETM packet type 25). The leader broadcasts the new channel 5 times, 300 ms apart,
+  and everyone switches 1.5 s after the first frame; each frame carries the time left. A
+  follower acts on the first frame of a move and refuses it when sync is off, the channel is
+  outside its region, it is already there, or a device it hears outranks the sender.
+- **Switching.** At the switch time `onChannelMove(channel)` is called once, on the loop task.
+  Return `false` and the library calls `esp_wifi_set_channel()` — only possible with no SoftAP.
+  Return `true` and the library leaves the radio alone: a SoftAP moves only by restarting, so
+  save, then restart from your own `loop()`, never inside the callback. With a SoftAP up and no
+  callback (or `false`), the library says it cannot move, and stays. ESP-NOW peers are
+  registered on channel 0 ("the current one"), so none needs registering again. After a live
+  switch the device heartbeats and re-advertises at once, and the transmit watchdog waits
+  `WCB_TXWD_HEARD_MS` before judging — a move is not a dead radio.
+- **Search** (PROBE 26 / REPLY 27). A device that leads its group and misses a board it knows
+  (a floor peer, a learned peer or the special peer, offline by the heartbeat sweep;
+  temporary and rank-255 devices are never missed) visits every other channel its region
+  allows: switch, broadcast a PROBE, listen 150 ms. Then it takes its group to a better leader
+  it found, or visits each worse group and sends it a MOVE home. Not before 40 s after boot,
+  only once the condition has held 10 s, then attempts at 0, 1, 2, 4, 8, 16 and 32 minutes.
+  It waits until the device can hop (no station on its SoftAP, no STA association) and is
+  quiet: no ensured send awaiting its ACK, no fragmented send, bulk transfer, sequence request
+  or watchdog probe in flight, and no command or raw packet in or out for 3 s
+  (`WCB_CHSYNC_QUIET_MS`; best-effort broadcasts such as telemetry do not count). While it is
+  away (about 1.5-2 s) `update()` sends nothing else — no heartbeat, advert, retry or probe —
+  every send the app makes returns `false` (an ensured one is retried once home), and every
+  frame received except a REPLY is dropped.
+- **Answering.** Every device with sync on answers a PROBE after `(id % 16) × 3 ms`, naming the
+  best device it hears, itself included.
+- **Region.** `setRegion(cc)` before `begin()`: `"01"` or an IDF country code (`AT AU BE BG BR
+  CA CH CN CY CZ DE DK EE ES FI FR GB GR HK HR HU IE IN IS IT JP KR LI LT LU LV MT MX NL NO NZ
+  PL PT RO SE SI SK TW US`). `begin()` applies it with `esp_wifi_set_country_code(cc, false)`
+  after WiFi starts and before the channel is set; `"01"` makes no call, unless the WiFi driver
+  restored another region from flash (the IDF keeps it there), which `"01"` then resets. If
+  WiFi is already running when `setRegion()` is called it applies at once too, so a host that
+  raises a SoftAP on 12-13 before `begin()` calls `WiFi.mode()`, then `setRegion()`, then
+  `softAP()`. Every device on the mesh needs the same region; 12-13 are legal in Europe and
+  most of the world, not in the US.
+- **Operator move.** `chanSyncMove(ch, &why)` sends a MOVE with the OPERATOR flag, which every
+  unpinned follower obeys whoever sent it, and moves this device with it. It is refused when a
+  pinned device is heard (it would stay, the mesh would go, and searching would bring everyone
+  back), when a SoftAP is up and no `onChannelMove()` is registered, and for a bad channel.
+- **Status.** `printChanSyncStatus(Serial)` ends in
+  `[CHSYNC:EN=1,CH=6,MAXCH=11,CC=01,RANK=105,PIN=0,LEAD=1,LRANK=1,LPIN=0,STATE=idle]`
+  (`STATE` is `idle`, `search` or `move`).
+- **Threads.** The ESP-NOW receive callback only copies these frames; every decision, send
+  and print happens in `update()`. `setChanSyncEnabled()` and `chanSyncSearchNow()` only set a
+  flag, so they are safe from a command callback; call `chanSyncMove()` and
+  `printChanSyncStatus()` from `loop()`.
+- **Needs ETM on** the WCBs (as WDP does). Firmware and libraries older than channel sync drop
+  packet types 25-27 and are left behind when the mesh moves.
+
 ---
 
 ## Callbacks
@@ -817,13 +917,37 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 | `SpecialPeer` | Talk to the out-of-band controller (e.g. NaviCore) at id 20 |
 | `NeighborDiscovery` | Learn the mesh over WDP — who's out there and what they can do |
 | `DeliveryStats` | Per-peer delivery counters, with a guided two-board bench procedure that proves each one |
-| `MgmtRelay` | Turn any ESP32 into a management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port, and optionally over a WebSocket from its own SoftAP or NaviCore's  |
+| `MgmtRelay` | Turn any ESP32 into a management relay — drive the Config Tool (Via WCB) and manage every WCB + the NaviCore over one USB port, and optionally over a WebSocket from its own SoftAP or NaviCore's, with a login token (`?AUTH,<token>`). It follows the mesh when it moves (rank 255, never leads) and remembers where it went |
 | `TxWatchdog` | Turn on the transmit watchdog and reboot when the library cannot recover the mesh |
+| `ChannelSync` | Start on the channel the mesh last moved to, save a move when it happens, set the region; status, search and operator move from the Serial Monitor |
 | `AllFeatures` | Interactive "kitchen sink" — every public method in one sketch, including a `t` key that dumps per-peer delivery statistics and `z` to reset them |
 
 ---
 
 ## Changelog
+
+### 1.19.0
+
+- **Channel sync** (`setChanSyncRank`, `setChanSyncEnabled`, `setRegion`, `maxChannel`,
+  `currentChannel`, `onChannelMove`, `chanSyncSearchNow`, `chanSyncMove`,
+  `printChanSyncStatus`; on by default). The mesh follows one channel: the device that leads
+  announces a MOVE (ETM packet type 25) and everyone switches together, and a group leader that
+  misses a known board searches the other channels (PROBE 26 / REPLY 27) and either takes its
+  group to a better leader or pulls the other group home. Every device advertises its key in
+  WDP TLV `0x14` CHAN and decodes its neighbors' into `WCBNeighbor::chanValid`/`chanChannel`/
+  `chanRank`/`chanFlags`/`chanCc`. The wire format and decisions are `src/WCB_ChanSyncWire.h`,
+  byte-identical to the WCB firmware's. Design: WCB repo `docs/CHANNEL_SYNC.md`. See *Channel
+  sync* above.
+- `setMeshChannel()` accepts 12-13 once `setRegion()` allows them (it was 1-11 only), and
+  `begin()` falls back to `WCB_MESH_CHANNEL` with a warning for a channel the region does not
+  allow.
+- `examples/ChannelSync` is new. `examples/MgmtRelay` (relay 1.3) follows the mesh as rank 255,
+  saves the channel it was moved to, takes `?CHSYNC`, `?CHSYNC,SEARCH`, `?CHSYNC,MOVE,<ch>` and
+  `RELAY_REGION`, prints `[WDPCH:...]` lines in `?WDP,DUMP`, and its WebSocket takes a login
+  token (`?RELAY,WIFI,TOKEN,<token>|CLEAR`, `RELAY_WS_TOKEN`): `[AUTH:REQUIRED]` on open, no
+  output and no command until `?AUTH,<token>`, `[AUTH:FAIL]` closes the session and locks every
+  `?AUTH` out for 1 s — the same protocol as a WCB's and NaviCore's WebSocket.
+- `WCB_CLIENT_VERSION_NUM` 11900.
 
 ### 1.18.1
 
