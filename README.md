@@ -558,8 +558,19 @@ Notes:
 - **One request in flight at a time**, shared between `requestSequenceNames()` and
   `requestSequence()`; a second call returns `false`. Poll `sequenceNamesPending()`, which
   gates either kind.
-- A request with no complete answer within ~4 s is abandoned silently — no callback fires,
+- A request with no answer within ~4 s is abandoned silently — no callback fires,
   because a half-list would look like a real answer. Just call again.
+- **A long list comes in pages, and the callback still fires once.** One mesh reply holds
+  2912 characters, about 180 names, and a board's sequence store holds a few hundred. A list
+  that does not fit comes a page per request (since 1.19.0; the WCB must be new enough too):
+  the library asks for each page itself, about 0.8 s a page, asks a page again after 3 s
+  without it (3 times), starts over if the list changes mid-pull (twice), and calls you once
+  with the whole list. A pull that cannot finish is abandoned with a `[WCB_Client] sequence
+  names ...` line on Serial and no callback. Use `sequenceNamesPending()` to tell "still
+  working" from "lost", not a fixed timeout. A WCB whose firmware predates paged names never
+  answers a list that long (its "Result too large" text is not taken for a list; 1.18.1 and
+  earlier delivered it as an empty one), and a WCB with paged names does not answer a library
+  older than 1.19.0 for one either, rather than send it something it would misread.
 - `requestSequenceNames()` returns `false` unless a callback is registered first.
 - Names only, never contents. The values live in the board's config pull, which fits one
   reply only up to 2912 characters for the *entire* board config; past that it takes a
@@ -970,6 +981,15 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
   association is treated like a SoftAP; devices seen as temporary or rank 255 are never missed by
   a search (NVS `wcb_peers`/`csnever`). Design: WCB repo `docs/CHANNEL_SYNC.md`. See *Channel
   sync* above.
+- **Stored-sequence names in pages.** `requestSequenceNames()` reads a list longer than one
+  2912-character mesh reply (about 180 names): it asks for page 0 with the new 59-byte
+  SEQ_PAGE_REQ (packet type 28) ahead of the old SEQ_REQ, then for each further page, and
+  joins the type-29 pages; `onSequenceNames()` still fires once, with the whole list. The
+  split, the page header and the join are `src/WCB_SeqNamesWire.h`, byte-identical to the
+  WCB firmware's (host-tested there by `tests/seqnames_page_test.cpp`). A one-reply answer is
+  now checked whole (8 hex digits, the count equal to the names): the "[ERROR] Result too
+  large to relay" text an older WCB sends is dropped, where it read as an empty list. Design:
+  WCB repo `docs/SEQUENCE_INVENTORY.md` §3. See *Stored-sequence inventory* above.
 - `setMeshChannel()` accepts 12-13 once `setRegion()` allows them (it was 1-11 only), and
   `begin()` falls back to `WCB_MESH_CHANNEL` with a warning for a channel the region does not
   allow.

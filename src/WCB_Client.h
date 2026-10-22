@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <atomic>
 #include "WCB_ChanSyncWire.h"   // channel sync wire format + decisions; byte-identical to the WCB firmware's copy
+#include "WCB_SeqNamesWire.h"   // the sequence-names reply's pages: split, header, reassembly; byte-identical too
 
 // Forward declaration — WCBStream is defined in WCBStream.h.
 // Keeps this header self-contained; users include WCBStream.h only when needed.
@@ -248,6 +249,12 @@ typedef struct __attribute__((packed)) {
 #define WCB_PACKET_SEQ_FRAG    14  // firmware PACKET_TYPE_SEQ_FRAG    (target → this)
 #define WCB_PACKET_SEQVAL_REQ  15  // firmware PACKET_TYPE_SEQVAL_REQ  (this → target)
 #define WCB_PACKET_SEQVAL_FRAG 16  // firmware PACKET_TYPE_SEQVAL_FRAG (target → this)
+// A names list longer than one reply (2912 characters, about 180 names) comes a page per
+// request (1.19.0, WCB_SeqNamesWire.h): the page request rides the 59-byte struct, the page
+// comes back as type 29. A WCB that predates it drops the 28 and answers the type-13 copies
+// sent behind it.
+#define WCB_PACKET_SEQ_PAGE_REQ 28 // firmware PACKET_TYPE_SEQ_PAGE_REQ (this → target)
+#define WCB_PACKET_SEQ_PAGE    29  // firmware PACKET_TYPE_SEQ_PAGE     (target → this)
 #define WCB_SEQ_PAYLOAD_SIZE  183  // firmware CONFIG_PAYLOAD_SIZE
 #define WCB_SEQ_MAX_CHUNKS    16   // firmware MGMT_MAX_CHUNKS (uint16 mask)
 #define WCB_SEQ_KEY_MAX       15   // NVS key limit — a longer key cannot be stored at all
@@ -270,6 +277,17 @@ typedef struct __attribute__((packed)) {
     uint8_t requesterWCB;
     char    key[16];               // NUL-terminated, ≤15 chars
 } wcb_packet_seqval_req_t;
+
+// One page of the names (59 B, the size of the request above on purpose: the 43-byte request
+// has no spare byte, and a WCB takes 59-byte requests on the queue its names handler reads).
+typedef struct __attribute__((packed)) {
+    char    structPassword[40];
+    uint8_t packetType;            // WCB_PACKET_SEQ_PAGE_REQ
+    uint8_t targetWCB;
+    uint8_t requesterWCB;
+    uint8_t page;                  // 0-based
+    uint8_t reserved[15];          // zero
+} wcb_packet_seqpage_req_t;
 
 typedef struct __attribute__((packed)) {
     char     structPassword[40];
@@ -529,6 +547,10 @@ typedef void (*WCBNeighborCallback)(const WCBNeighbor& nb);
 //   names     : comma-separated key list, NUL-terminated ("" when count == 0).
 //               Keys can never contain a comma (the firmware takes a stored key as
 //               everything before the first comma), so a plain split is safe.
+// Fires ONCE per request, with the whole list, also when the board sent it in pages
+// (1.19.0): a list arriving page by page is joined first, so every call is a whole
+// inventory, as before - a consumer that replaces its cached list on each call can
+// never cache part of one.
 // `names` points at library-owned memory that is freed when the callback returns —
 // copy anything you need to keep.
 typedef void (*WCBSequenceNamesCallback)(uint8_t wcbNumber, uint32_t hash,
@@ -1052,12 +1074,24 @@ public:
     // dropped on a busy mesh); the target dedups within 1.5 s, so this still yields
     // exactly ONE response. Only one request may be in flight at a time — a second
     // call while one is pending returns false rather than corrupting reassembly.
-    // A request that gets no complete answer within ~4 s is abandoned silently;
-    // just call again.
+    // A request that gets no answer within ~4 s is abandoned silently; just call
+    // again.
+    //
+    // A list longer than one reply (2912 characters, about 180 names) comes in
+    // pages (1.19.0): the first request asks for page 0 in a form only a WCB with
+    // paged names answers, and the old form behind it; the library then asks for
+    // each further page itself (each up to 3 times, 3 s apart), starts over if the
+    // list changes mid-pull (at most twice), and fires the callback once with the
+    // whole list - about 0.8 s a page. A pull that cannot finish (a page that never
+    // comes, a list that keeps changing, no heap for it, 60 s) is abandoned, with a
+    // "[WCB_Client] sequence names ..." line on Serial and no callback; so is a
+    // reply that is not an inventory, such as the "[ERROR] Result too large" text a
+    // WCB before paged names sends for a list that does not fit one reply.
     //
     // Returns false if: not started, `wcbNumber` out of range, a request is already
     // pending, no callback registered, or the reassembly buffer couldn't be
-    // allocated (~3 KB, held only while the request is in flight).
+    // allocated (~3 KB, held only while the request is in flight; a paged list also
+    // holds its own length until the callback returns).
     bool requestSequenceNames(uint8_t wcbNumber);
 
     // True while a requestSequenceNames() or requestSequence() is awaiting its
@@ -1823,8 +1857,25 @@ private:
     bool _maybeHandleMgmtFrag(const uint8_t* mac, const uint8_t* data, int len);
 
     char*         _seqChunks      = nullptr; // [WCB_SEQ_MAX_CHUNKS][WCB_SEQ_PAYLOAD_SIZE+1], heap
-    unsigned long _seqDeadlineMs  = 0;       // abandon the request at this time
+    unsigned long _seqDeadlineMs  = 0;       // abandon the request at this time (a value; page 0 of the names)
     volatile bool _seqComplete    = false;   // set on the RX task, consumed by update()
+    // Names in pages (WCB_SeqNamesWire.h). _seqFragType is the type of the session being
+    // reassembled (14 the whole list, 29 a page, 16 a value), adopted with its first frag.
+    // _seqDoneSession is the page just taken, whose second pass is dropped. The joined list
+    // grows in _seqNames (heap, sized at page 0) and goes to the callback once.
+    uint8_t                _seqFragType    = 0;
+    uint16_t               _seqDoneSession = 0;
+    seqn::Assembly         _seqAsm;
+    char*                  _seqNames       = nullptr;
+    size_t                 _seqNamesCap    = 0;
+    uint8_t                _seqTries       = 0;   // requests of the page asked for
+    uint8_t                _seqRestarts    = 0;   // the list changed mid-pull
+    unsigned long          _seqStartMs     = 0;
+    unsigned long          _seqAskedMs     = 0;
+    volatile unsigned long _seqHeardMs     = 0;   // last frag taken (RX task)
+    void _seqSendNames(unsigned page, bool withOld);
+    void _seqRearm(uint16_t doneSession);
+    void _seqNamesPage(const String& full, unsigned long now);
     // The RX task writes into _seqChunks while the LOOP task frees it on delivery
     // or timeout — a use-after-free window without this. Same pattern as _bulkMux:
     // the guarded regions are tiny (a bounds check + one 183-byte memcpy on RX, a
