@@ -38,7 +38,10 @@ and neighbour discovery, bulk transfer, and a raw-packet hook that OTA rides on.
    decision (`judgeMove`, `shouldSearch`, `judgeSearch`), host-tested there by
    `tests/chansync_wire_test.cpp`. Never edit it here alone: change the WCB copy, run its test,
    copy it over (`git hash-object` of both must match). The library code around it is plumbing
-   only; re-deriving an ordering or a verdict here splits the fleet.
+   only; re-deriving an ordering or a verdict here splits the fleet. **`src/WCB_SeqNamesWire.h`
+   is the same kind of copy** of `Code/WCB/WCB_SeqNamesWire.h`: where a stored-sequence names
+   list too long for one reply is split into pages, the page header, and the join, host-tested
+   there by `tests/seqnames_page_test.cpp`. Same rule.
 7. **Off its channel the library is a visitor.** A channel-sync search sets `_csOffHome` just
    before the radio leaves (not when the search starts: until then it is home, and a MOVE heard
    is held for after the search), and while it is set `update()` returns after `_csTick()`,
@@ -65,8 +68,9 @@ No test suite. The checks are:
 # WCB_Client ... in folder:" line names it. A private --build-path keeps the cache to yourself.
 arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . --build-path .build/all examples/AllFeatures
 
-# The channel-sync header must be the WCB firmware's file, byte for byte (rule 6):
+# The channel-sync and sequence-names headers must be the WCB firmware's files, byte for byte (rule 6):
 git hash-object src/WCB_ChanSyncWire.h   # == the WCB repo's Code/WCB/WCB_ChanSyncWire.h
+git hash-object src/WCB_SeqNamesWire.h   # == the WCB repo's Code/WCB/WCB_SeqNamesWire.h
 ```
 
 Real verification is on hardware, with at least one actual WCB present — mesh behaviour
@@ -79,6 +83,7 @@ change has only been compiled.
 |---|---|
 | `src/WCB_Client.{h,cpp}` | the library — join, send, receive, WDP, heartbeats, bulk, channel sync (the `_cs*` section at the end of the .cpp) |
 | `src/WCB_ChanSyncWire.h` | channel sync wire format + decisions — the WCB firmware's file, byte-identical (rule 6) |
+| `src/WCB_SeqNamesWire.h` | the sequence-names reply in pages: split, page header, join — the WCB firmware's file, byte-identical (rule 6) |
 | `src/WCBStream.{h,cpp}` | `Stream` adapter that forwards raw bytes (Maestro packets) over the mesh |
 | `src/WCB_Mgmt.h` | `WcbMgmt`: makes a host the Wizard's management relay (NaviCore) |
 | `examples/` | one per capability — `AllFeatures` is the broadest; `MgmtRelay` is a product in its own right (WebSocket with a login token, channel persistence) |
@@ -108,7 +113,10 @@ packet type, a whole-config CRC and a new Wizard to make safe (`?MGMT,PULL,<n>,P
 `src/WCB_Mgmt.h`). Adding a bulk fetch walks straight back into that. Consumers walk the name
 list instead. `WCBNeighbor::seqHash` (WDP TLV `0x13`) covers names **and** values, so it is
 also how you confirm a write landed. Design doc lives in the WCB repo,
-`docs/SEQUENCE_INVENTORY.md`.
+`docs/SEQUENCE_INVENTORY.md`. The NAME list itself can pass one reply (a few hundred keys);
+it then comes a page per request (`WCB_SeqNamesWire.h`, packet types 28/29), joined here
+and delivered to `onSequenceNames()` once - never a page at a time, since every consumer
+(NaviCore's picker) replaces its cached list on each call.
 
 **Writes deliberately have no wire format of their own.** `saveSequence()`/`deleteSequence()`
 build `?SEQ,SAVE`/`?SEQ,CLEAR` commands and hand them to `send()`, which already fragments

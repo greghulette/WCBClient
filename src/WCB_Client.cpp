@@ -1248,8 +1248,14 @@ static_assert(sizeof(wcb_packet_seq_frag_t) == 230,
               "wcb_packet_seq_frag_t must match the firmware's espnow_struct_config_frag (230 B)");
 static_assert(sizeof(wcb_packet_seqval_req_t) == 59,
               "wcb_packet_seqval_req_t must match the firmware's espnow_struct_seqval_req (59 B)");
+static_assert(sizeof(wcb_packet_seqpage_req_t) == seqn::PAGE_REQ_LEN &&
+              offsetof(wcb_packet_seqpage_req_t, page) == seqn::PAGE_REQ_PAGE_AT,
+              "wcb_packet_seqpage_req_t must match the firmware's espnow_struct_seqpage_req (59 B, page at 43)");
+static_assert(WCB_PACKET_SEQ_REQ == seqn::PT_SEQ_REQ && WCB_PACKET_SEQ_FRAG == seqn::PT_SEQ_FRAG &&
+              WCB_PACKET_SEQ_PAGE_REQ == seqn::PT_PAGE_REQ && WCB_PACKET_SEQ_PAGE == seqn::PT_PAGE,
+              "WCB_SeqNamesWire.h packet types != WCB_Client.h's");
 
-#define WCB_SEQ_TIMEOUT_MS 4000   // generous: 3x REQ + up to 16 frags at 20 ms apart
+#define WCB_SEQ_TIMEOUT_MS 4000   // generous: 3x REQ + up to 16 frags at 20 ms apart (= seqn::WAIT_FIRST_MS)
 
 void WCB_Client::onSequenceNames(WCBSequenceNamesCallback callback) {
     _seqNamesCallback = callback;
@@ -1280,13 +1286,71 @@ void WCB_Client::_seqReset() {
     _seqPending  = false;
     portEXIT_CRITICAL(&_seqMux);
     if (doomed) free(doomed);
+    if (_seqNames) free(_seqNames);
+    _seqNames        = nullptr;
+    _seqNamesCap     = 0;
+    _seqAsm.reset();
     _seqWantFrag     = 0;
     _seqReqKey[0]    = '\0';
     _seqTargetWCB    = 0;
     _seqSessionId    = 0;
     _seqTotalChunks  = 0;
     _seqReceivedMask = 0;
+    _seqFragType     = 0;
+    _seqDoneSession  = 0;
+    _seqTries        = 0;
+    _seqRestarts     = 0;
+    _seqHeardMs      = 0;
     _seqComplete     = false;
+}
+
+// Ask `_seqTargetWCB` for one page of its names (WCB_SeqNamesWire.h): SEQ_PAGE_REQ x3, and for
+// the first request of a pull the old SEQ_REQ x3 behind it, for a WCB that predates paged
+// names (it drops the 59-byte 28 at its receive filter and answers a 13). A WCB with paged
+// names answers the first 28 and takes the 13s for copies. Broadcast 3x — a first frame to a
+// given board is routinely dropped on a busy mesh, and the target dedups repeats of one
+// (requester, page) inside 1.5 s, so this is still one reply. Broadcast (not unicast) so this
+// works without the target being a peer yet.
+void WCB_Client::_seqSendNames(unsigned page, bool withOld) {
+    wcb_packet_seqpage_req_t pr;
+    memset(&pr, 0, sizeof(pr));
+    strncpy(pr.structPassword, _password, sizeof(pr.structPassword) - 1);
+    pr.packetType   = WCB_PACKET_SEQ_PAGE_REQ;
+    pr.targetWCB    = _seqTargetWCB;
+    pr.requesterWCB = (uint8_t)_deviceID;
+    pr.page         = (uint8_t)page;
+    for (int i = 0; i < 3; i++) {
+        _espSend(_broadcastMAC, (const uint8_t*)&pr, sizeof(pr));
+        delay(15);
+    }
+    if (withOld) {
+        wcb_packet_seq_req_t pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
+        pkt.packetType   = WCB_PACKET_SEQ_REQ;
+        pkt.targetWCB    = _seqTargetWCB;
+        pkt.requesterWCB = (uint8_t)_deviceID;
+        for (int i = 0; i < 3; i++) {
+            _espSend(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
+            delay(15);
+        }
+    }
+    _seqAskedMs = millis();
+}
+
+// Loop task: clear the reassembly slot for the next page, keeping its buffer. The RX task
+// writes nothing while _seqComplete is set, so the slot is ours until that is cleared here.
+// `doneSession` is the page just taken: the rest of its second pass is dropped.
+void WCB_Client::_seqRearm(uint16_t doneSession) {
+    portENTER_CRITICAL(&_seqMux);
+    if (_seqChunks) memset(_seqChunks, 0, (size_t)WCB_SEQ_MAX_CHUNKS * (WCB_SEQ_PAYLOAD_SIZE + 1));
+    _seqSessionId    = 0;
+    _seqTotalChunks  = 0;
+    _seqReceivedMask = 0;
+    _seqFragType     = 0;
+    _seqDoneSession  = doneSession;
+    _seqComplete     = false;
+    portEXIT_CRITICAL(&_seqMux);
 }
 
 bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
@@ -1300,29 +1364,23 @@ bool WCB_Client::requestSequenceNames(uint8_t wcbNumber) {
     if (!_seqChunks) return false;
 
     _seqPending      = true;
-    _seqWantFrag     = WCB_PACKET_SEQ_FRAG;
+    _seqWantFrag     = WCB_PACKET_SEQ_FRAG;   // names: a whole list (14) or a page (29)
     _seqReqKey[0]    = '\0';
     _seqTargetWCB    = wcbNumber;
     _seqSessionId    = 0;      // adopt whatever session the first frag carries
     _seqTotalChunks  = 0;
     _seqReceivedMask = 0;
+    _seqFragType     = 0;
+    _seqDoneSession  = 0;
+    _seqAsm.reset();
+    _seqTries        = 1;
+    _seqRestarts     = 0;
+    _seqHeardMs      = 0;
     _seqComplete     = false;
-    _seqDeadlineMs   = millis() + WCB_SEQ_TIMEOUT_MS;
+    _seqStartMs      = millis();
+    _seqDeadlineMs   = _seqStartMs + WCB_SEQ_TIMEOUT_MS;
 
-    wcb_packet_seq_req_t pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    strncpy(pkt.structPassword, _password, sizeof(pkt.structPassword) - 1);
-    pkt.packetType   = WCB_PACKET_SEQ_REQ;
-    pkt.targetWCB    = wcbNumber;
-    pkt.requesterWCB = (uint8_t)_deviceID;
-
-    // Broadcast 3x — a first frame to a given board is routinely dropped on a busy
-    // mesh, and the target dedups repeats inside 1.5 s, so this is still one reply.
-    // Broadcast (not unicast) so this works without the target being a peer yet.
-    for (int i = 0; i < 3; i++) {
-        _espSend(_broadcastMAC, (const uint8_t*)&pkt, sizeof(pkt));
-        delay(15);
-    }
+    _seqSendNames(0, true);
     return true;
 }
 
@@ -1345,6 +1403,8 @@ bool WCB_Client::requestSequence(uint8_t wcbNumber, const char* key) {
     _seqSessionId    = 0;
     _seqTotalChunks  = 0;
     _seqReceivedMask = 0;
+    _seqFragType     = 0;
+    _seqDoneSession  = 0;
     _seqComplete     = false;
     _seqDeadlineMs   = millis() + WCB_SEQ_TIMEOUT_MS;
 
@@ -1407,8 +1467,10 @@ bool WCB_Client::_maybeHandleSeqFrag(const uint8_t* data, int len) {
 
     // Must be the kind of reply this slot is waiting for. A frag of the OTHER kind
     // (a late leftover from a previous request) would otherwise be reassembled into
-    // the current one and delivered as garbage.
-    if (pkt.packetType != _seqWantFrag)                            return false;
+    // the current one and delivered as garbage. Names come whole (14) or as a page (29).
+    const bool names = _seqWantFrag == WCB_PACKET_SEQ_FRAG;
+    if (names ? (pkt.packetType != WCB_PACKET_SEQ_FRAG && pkt.packetType != WCB_PACKET_SEQ_PAGE)
+              : pkt.packetType != _seqWantFrag)                    return false;
     if (strncmp(pkt.structPassword, _password,
                 sizeof(pkt.structPassword) - 1) != 0)              return false;
     if (pkt.requesterWCB != (uint8_t)_deviceID)                    return false;
@@ -1419,47 +1481,119 @@ bool WCB_Client::_maybeHandleSeqFrag(const uint8_t* data, int len) {
     if (pkt.totalChunks == 0 || pkt.totalChunks > WCB_SEQ_MAX_CHUNKS) return true;
     if (pkt.chunkIdx >= pkt.totalChunks)                             return true;
 
-    if (_seqSessionId == 0) {          // first frag of the answer — adopt its session
-        _seqSessionId   = pkt.sessionId;
-        _seqTotalChunks = pkt.totalChunks;
-    } else if (pkt.sessionId != _seqSessionId) {
-        return true;                   // a different session; consumed but ignored
-    }
-
-    // Guarded: _seqTick() may be freeing this buffer on the loop task right now
-    // (a timeout firing as a late frag lands). Re-test _seqChunks INSIDE the lock —
-    // the check at the top of this function is only a cheap early-out.
+    // Guarded: _seqTick() may be freeing this buffer, or clearing it for the next page,
+    // on the loop task right now. Re-test _seqChunks INSIDE the lock — the check at the
+    // top of this function is only a cheap early-out. The session is adopted inside it
+    // too, so a re-arm for the next page cannot land between the test and the adoption.
     portENTER_CRITICAL(&_seqMux);
-    if (_seqChunks && !(_seqReceivedMask & (1 << pkt.chunkIdx))) {
-        char* slot = _seqChunks + (size_t)pkt.chunkIdx * (WCB_SEQ_PAYLOAD_SIZE + 1);
-        memcpy(slot, pkt.payload, WCB_SEQ_PAYLOAD_SIZE);
-        slot[WCB_SEQ_PAYLOAD_SIZE] = '\0';
-        _seqReceivedMask |= (1 << pkt.chunkIdx);
-        if (_seqReceivedMask == (uint16_t)((1 << _seqTotalChunks) - 1)) _seqComplete = true;
+    if (_seqChunks && !_seqComplete && pkt.sessionId != _seqDoneSession) {
+        if (_seqSessionId == 0) {          // first frag of the answer — adopt its session
+            _seqSessionId   = pkt.sessionId;
+            _seqTotalChunks = pkt.totalChunks;
+            _seqFragType    = pkt.packetType;
+        }
+        // A frag of another session (a late copy of an earlier answer) is consumed but ignored.
+        if (pkt.sessionId == _seqSessionId && pkt.packetType == _seqFragType &&
+            pkt.totalChunks == _seqTotalChunks && !(_seqReceivedMask & (1 << pkt.chunkIdx))) {
+            char* slot = _seqChunks + (size_t)pkt.chunkIdx * (WCB_SEQ_PAYLOAD_SIZE + 1);
+            memcpy(slot, pkt.payload, WCB_SEQ_PAYLOAD_SIZE);
+            slot[WCB_SEQ_PAYLOAD_SIZE] = '\0';
+            _seqReceivedMask |= (1 << pkt.chunkIdx);
+            _seqHeardMs = millis();
+            if (_seqReceivedMask == (uint16_t)((1 << _seqTotalChunks) - 1)) _seqComplete = true;
+        }
     }
     portEXIT_CRITICAL(&_seqMux);
     return true;
 }
 
-// Loop task: deliver a completed inventory, or abandon a request that timed out.
+// Loop task: one page of a names list that did not fit one reply (WCB_SeqNamesWire.h). Checks
+// it, joins it into _seqNames, and asks for the next page, starts over, or delivers the list.
+// The reassembly slot is still held (_seqComplete); every path re-arms it, resets, or delivers.
+void WCB_Client::_seqNamesPage(const String& full, unsigned long now) {
+    (void)now;
+    const uint16_t sid = _seqSessionId;
+    seqn::PageHeader h;
+    size_t keysAt = 0;
+    if (!seqn::parsePageHeader(full.c_str(), full.length(), h, keysAt)) {
+        _seqRearm(sid);                    // not a page: keep waiting (the retry timer asks again)
+        return;
+    }
+    seqn::Step st = _seqAsm.check(h);
+    if (st == seqn::STEP_STALE || st == seqn::STEP_BAD) {
+        _seqRearm(sid);
+        return;
+    }
+    if (st == seqn::STEP_OK && h.page == 0) {
+        if (_seqNames) free(_seqNames);
+        _seqNamesCap = (size_t)seqn::wholeLen(h.count, h.keyBytes) + 1;
+        _seqNames    = (char*)malloc(_seqNamesCap);
+        if (!_seqNames || !_seqAsm.start(h, _seqNames, _seqNamesCap)) {
+            Serial.printf("[WCB_Client] sequence names from WCB%u: %u names need %u bytes the heap does not have "
+                          "- abandoned\n", (unsigned)_seqTargetWCB, h.count, (unsigned)_seqNamesCap);
+            _seqReset();
+            return;
+        }
+    }
+    if (st == seqn::STEP_OK)
+        st = _seqAsm.append(full.c_str() + keysAt, full.length() - keysAt, _seqNames, _seqNamesCap);
+    if (st == seqn::STEP_BAD) {
+        _seqRearm(sid);                    // malformed: keep waiting (the retry timer asks again)
+        return;
+    }
+    if (st == seqn::STEP_RESTART) {
+        if (_seqRestarts >= seqn::RESTARTS_MAX) {
+            Serial.printf("[WCB_Client] sequence names from WCB%u changed %u times while they were read - "
+                          "abandoned\n", (unsigned)_seqTargetWCB, (unsigned)_seqRestarts + 1);
+            _seqReset();
+            return;
+        }
+        _seqRestarts++;
+        _seqAsm.reset();
+        _seqRearm(sid);
+        _seqTries = 1;
+        _seqSendNames(0, false);           // it pages, so it is new enough for a 28
+        return;
+    }
+    if (st == seqn::STEP_NEXT) {
+        _seqRearm(sid);
+        _seqTries = 1;
+        _seqSendNames(_seqAsm.next, false);
+        return;
+    }
+    // STEP_DONE: the whole list, once. Detach it from the slot before the reset so the
+    // consumer may issue the next request from inside the callback.
+    // _seqNames is "<8 hex>,<count>,k1,k2,...": the names start after the second comma.
+    char*          list  = _seqNames;
+    const size_t   hl    = (size_t)seqn::digits(_seqAsm.first.count) + 9;   // "<8 hex>,<count>"
+    const uint32_t hash  = _seqAsm.first.hash;
+    const uint16_t count = (uint16_t)_seqAsm.first.count;
+    const uint8_t  src   = _seqTargetWCB;
+    const char*    names = (count && _seqAsm.len > hl && list[hl] == ',') ? list + hl + 1 : "";
+    _seqNames = nullptr;
+    WCBSequenceNamesCallback cb = _seqNamesCallback;
+    _seqReset();
+    if (cb) cb(src, hash, count, names);
+    free(list);
+}
+
+// Loop task: deliver a completed inventory, take a page, or abandon a request that timed out.
 void WCB_Client::_seqTick(unsigned long now) {
     if (!_seqPending) return;
 
     if (_seqComplete) {
-        // Take the buffer away from the RX task first, under the lock, so the
-        // reassembly below reads memory nothing else can touch.
+        // The RX task writes nothing while _seqComplete is set, so the chunks read below
+        // are ours; the slot is re-armed for a next page, or reset.
         portENTER_CRITICAL(&_seqMux);
         char*   buf   = _seqChunks;
         uint8_t total = _seqTotalChunks;
-        _seqChunks    = nullptr;
-        _seqPending   = false;
+        uint8_t ftype = _seqFragType;
         portEXIT_CRITICAL(&_seqMux);
         if (!buf) { _seqReset(); return; }
 
         String full;
         for (int i = 0; i < total; i++)
             full += (const char*)(buf + (size_t)i * (WCB_SEQ_PAYLOAD_SIZE + 1));
-        free(buf);
 
         uint8_t src  = _seqTargetWCB;
         uint8_t kind = _seqWantFrag;
@@ -1492,23 +1626,58 @@ void WCB_Client::_seqTick(unsigned long now) {
             return;
         }
 
-        // Names reply: "<hash8hex>,<count>[,<key>...]" — parse the header here so
-        // every consumer doesn't reimplement it.
-        uint32_t hash  = 0;
-        uint16_t count = 0;
-
-        int c1 = full.indexOf(',');
-        int c2 = (c1 >= 0) ? full.indexOf(',', c1 + 1) : -1;
-        if (c1 > 0) {
-            hash  = (uint32_t)strtoul(full.substring(0, c1).c_str(), nullptr, 16);
-            count = (uint16_t)full.substring(c1 + 1, (c2 >= 0) ? c2 : full.length()).toInt();
+        if (ftype == WCB_PACKET_SEQ_PAGE) {
+            _seqNamesPage(full, now);
+            return;
         }
-        // c2 < 0 means a zero-length list ("<hash>,0") — the name list stays "".
-        String nameList = (c2 >= 0) ? full.substring(c2 + 1) : String("");
 
+        // Names in one reply: "<hash8hex>,<count>[,<key>...]" — parsed here so every
+        // consumer doesn't reimplement it, and checked whole: the count must be the
+        // number of keys. Anything else is not an inventory - the "[ERROR] Result too
+        // large to relay" text a WCB before paged names sends for a list that does not
+        // fit, which 1.18.1 and earlier delivered as an EMPTY list - and is dropped.
+        uint32_t hash = 0;
+        unsigned count = 0;
+        size_t   at = 0;
+        const bool ok = seqn::parseWhole(full.c_str(), full.length(), hash, count, at);
         WCBSequenceNamesCallback cb = _seqNamesCallback;
         _seqReset();
-        if (cb) cb(src, hash, count, nameList.c_str());
+        if (!ok) {
+            Serial.printf("[WCB_Client] sequence names from WCB%u: the reply is not a list (\"%.40s\") - dropped\n",
+                          (unsigned)src, full.c_str());
+            return;
+        }
+        String nameList = full.substring(at);
+        if (cb) cb(src, hash, (uint16_t)count, nameList.c_str());
+        return;
+    }
+
+    if (_seqWantFrag == WCB_PACKET_SEQ_FRAG) {
+        // Names. Page 0 of a first pull is asked once, as the names always were: silence
+        // within WCB_SEQ_TIMEOUT_MS is a board that is not there. Once the board has paged
+        // (a later page, or page 0 again after the list changed), a page that brings no
+        // frag for seqn::RETRY_MS is asked again, up to seqn::PAGE_TRIES times.
+        if ((long)(now - _seqStartMs) >= (long)seqn::PULL_MAX_MS) {
+            Serial.printf("[WCB_Client] sequence names from WCB%u did not finish in %u s - abandoned\n",
+                          (unsigned)_seqTargetWCB, (unsigned)(seqn::PULL_MAX_MS / 1000));
+            _seqReset();
+            return;
+        }
+        if (_seqAsm.next == 0 && _seqRestarts == 0) {
+            if ((long)(now - _seqDeadlineMs) >= 0) _seqReset();   // silent, as before
+            return;
+        }
+        const unsigned long heard = _seqHeardMs;
+        const unsigned long last  = (long)(heard - _seqAskedMs) > 0 ? heard : _seqAskedMs;
+        if ((long)(now - last) < (long)seqn::RETRY_MS) return;
+        if (_seqTries >= seqn::PAGE_TRIES) {
+            Serial.printf("[WCB_Client] sequence names from WCB%u: page %u never came (asked %u times) - abandoned\n",
+                          (unsigned)_seqTargetWCB, _seqAsm.next + 1, (unsigned)_seqTries);
+            _seqReset();
+            return;
+        }
+        _seqTries++;
+        _seqSendNames(_seqAsm.next, false);
         return;
     }
 
