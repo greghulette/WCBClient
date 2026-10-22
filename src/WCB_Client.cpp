@@ -194,6 +194,7 @@ bool WCB_Client::begin() {
     // Restore auto-joined peers persisted by a previous session — they are
     // permanent members until the app forgets them (forgetPeer/clearLearnedPeers).
     _loadLearnedPeers();
+    _csLoadNeverMiss();          // channel sync: ids a search never misses (after the fingerprint check above)
     _started = true;             // enableSpecialPeer() after begin() registers immediately
 
     Serial.printf("[WCB_Client] Joined WCB network as device ID %d "
@@ -1589,6 +1590,15 @@ void WCB_Client::setMeshChannel(uint8_t channel) {
         wifi_mode_t mode = WiFi.getMode();
         bool apActive = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
         if (!apActive) esp_wifi_set_channel(_meshChannel, WIFI_SECOND_CHAN_NONE);
+        // A host that took a channel-sync move (onChannelMove returned true) and applies it
+        // live, without a restart, does it with this call: the device has arrived.
+        uint8_t primary = 0;
+        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        if (_csHostMoveCh && channel == _csHostMoveCh &&
+            esp_wifi_get_channel(&primary, &second) == ESP_OK && primary == channel) {
+            _csHostMoveCh = 0;
+            _csArrived(channel, millis());
+        }
     }
 }
 
@@ -2084,6 +2094,17 @@ void WCB_Client::_wdpTick() {
         _sendWdpAdvert();
         _wdpBootLeft--;
         _wdpNextBootMs = now + 1300;
+        // Channel sync: one SOLICIT after the first boot advert, as a WCB sends one
+        // (WCB_WDP.cpp wdpTick), so every neighbor re-advertises and this device has their
+        // CHAN facts (TLV 0x14) within seconds, not at their next 60 s backstop - until then
+        // every key is derived, SYNC off, and this device takes itself for its group's
+        // leader. After the first advert, not before it: the boot adverts still to come
+        // repair the record of a WCB_Client older than 1.15.1, which takes a solicit for an
+        // empty advert. (A device with no identity sends it from _csTick instead.)
+        if (!_csBootSolicited) {
+            _csBootSolicited = true;
+            if (_csEnabled) _sendWdpSolicit();
+        }
     }
     if ((long)(now - _wdpNextAdvertMs) >= 0) {   // rollover-safe
         _sendWdpAdvert();
@@ -2219,6 +2240,17 @@ void WCB_Client::_handleWdpAdvert(uint8_t senderWCB, const uint8_t* cmd) {
     _csPeer[senderWCB - 1].has = hasChan;
     if (hasChan) _csPeer[senderWCB - 1].f = cf;
     portEXIT_CRITICAL(&_csMux);
+    // Never missed by a search (_csMemberMissing): a device that says it is temporary or
+    // never leads. Sticky - the record saying so ages out when the device leaves - so it is
+    // a bit here, saved to NVS from the loop task; an id that later advertises as anything
+    // else (reassigned) loses it. Only this task writes the word.
+    {
+        const bool     never = nb.temporary || (hasChan && cf.rank == chansync::RANK_NEVER);
+        const uint32_t bit   = 1UL << (senderWCB - 1);
+        const uint32_t was   = _csNeverMiss;
+        const uint32_t upd   = never ? (was | bit) : (was & ~bit);
+        if (upd != was) { _csNeverMiss = upd; _csNeverMissDirty = true; }
+    }
 
     // Auto-join: register a regular WCB (not a client device, not the special
     // peer) as an ESP-NOW peer once we've heard it advertise at least twice, so
@@ -2755,7 +2787,8 @@ void WCB_Client::_handleReceive(const uint8_t* mac, const uint8_t* data, int len
     if (len != (int)sizeof(wcb_packet_etm_t)) {
         // Channel sync: off the home channel nothing raw is ours (a search visit or a pull).
         if (_csOffHome) return;
-        _csNoteBusy();   // OTA, config pulls, sequence replies: a search waits until they stop
+        _csNoteBusy();   // OTA, config pulls, sequence replies: a search waits until they stop...
+        { const unsigned long t = millis(); _csRawRxMs = t ? t : 1; }   // ...and so does a live switch (_csMoveBusy)
         // A stored-sequence inventory reply we asked for? Consume it here rather
         // than making every consumer hand-roll the reassembly. Only intercepts
         // while a request is actually in flight and the packet passes every check,
@@ -3422,10 +3455,20 @@ void WCB_Client::chanSyncSearchNow() {
                       !_started ? "not started (call begin() first)" : "channel sync is off");
         return;
     }
+    // The boot grace holds a requested search too, as the firmware's does: until the boot
+    // SOLICIT's adverts and the heartbeats are in, every key is derived and this device
+    // takes itself for its group's leader.
+    const unsigned long t0 = millis();
+    if (t0 - _csBootMs < chansync::BOOT_GRACE_MS || _csHostMoveCh) {
+        Serial.printf("[WCB_Client] channel sync: no search - %s\n",
+                      _csHostMoveCh ? "the host is still applying a move" :
+                                      "the boot grace (40 s after begin(): who leads is still settling)");
+        return;
+    }
     // Only a group's leader searches, by request too: judgeSearch weighs what it finds
     // against the searcher, so a follower would take itself off to a group its own
     // leader outranks - and its group, judging that MOVE, would rightly stay behind.
-    const chansync::Key self = _csSelfKey(), lead = _csBestPresent(millis());
+    const chansync::Key self = _csSelfKey(), lead = _csBestPresent(t0);
     if (lead.id != self.id) {
         Serial.printf("[WCB_Client] channel sync: no search - WCB%u (rank %u) leads this group; a search is its job\n",
                       lead.id, lead.rank);
@@ -3440,15 +3483,19 @@ bool WCB_Client::chanSyncMove(uint8_t channel, String* why) {
     char reason[160];
     reason[0] = '\0';
     const unsigned long now = millis();
+    const char* w = nullptr;
     if (!_started)                                          snprintf(reason, sizeof(reason), "not started (call begin() first)");
     else if (!_csEnabled)                                   snprintf(reason, sizeof(reason), "channel sync is off");
     else if (!chansync::validChannel(channel, _csMaxCh))    snprintf(reason, sizeof(reason), "channel %u is outside 1-%u (region \"%s\")",
                                                                      channel, _csMaxCh, _csRegion);
     else if (channel == currentChannel())                   snprintf(reason, sizeof(reason), "the mesh is already on channel %u", channel);
-    else if (_csSearch != CS_SEARCH_IDLE || _csMovePending || _csAnnLeft)
+    else if (_csSearch != CS_SEARCH_IDLE || _csMovePending || _csAnnLeft || _csHostMoveCh)
                                                             snprintf(reason, sizeof(reason), "a move or search is already running");
-    else if (_csSoftApUp() && !_csMoveCb)                   snprintf(reason, sizeof(reason), "a SoftAP owns this device's channel and no "
-                                                                     "onChannelMove() handler applies a move, so it could not follow");
+    else if (!_csViewSettled(now))                          snprintf(reason, sizeof(reason), "the neighbors' channel facts are still "
+                                                                     "arriving (%lu s after begin()) - a pinned device may not be known yet",
+                                                                     (unsigned long)(WCB_CHSYNC_VIEW_SETTLE_MS / 1000UL));
+    else if (_csIfaceUp(&w) && !_csMoveCb)                  snprintf(reason, sizeof(reason), "%s owns this device's channel and no "
+                                                                     "onChannelMove() handler applies a move, so it could not follow", w);
     else {
         // A pinned device stays: the mesh would go without it, and its leader's search
         // would bring everyone back.
@@ -3483,7 +3530,8 @@ void WCB_Client::printChanSyncStatus(Print& out) {
     const unsigned long now  = millis();
     const chansync::Key self = _csSelfKey();
     const chansync::Key lead = _csBestPresent(now);
-    const char* state = _csSearch != CS_SEARCH_IDLE ? "search" : (_csMovePending || _csAnnLeft) ? "move" : "idle";
+    const char* state = _csSearch != CS_SEARCH_IDLE ? "search" :
+                        (_csMovePending || _csAnnLeft || _csHostMoveCh) ? "move" : "idle";
     const uint8_t ch  = currentChannel();
     out.printf("Channel sync: %s - channel %u, region %s (channels 1-%u), rank %u%s\n",
                _csEnabled ? "on" : "off", ch, _csRegion, _csMaxCh, self.rank,
@@ -3493,14 +3541,23 @@ void WCB_Client::printChanSyncStatus(Print& out) {
                     (lead.flags & chansync::F_PINNED) ? ", joined to a network" : "");
     if (_csMovePending) {
         const long left = (long)(_csMoveAtMs - now);
-        out.printf("  moving to channel %u in %ld ms\n", _csMoveCh, left > 0 ? left : 0L);
+        out.printf("  moving to channel %u in %ld ms%s\n", _csMoveCh, left > 0 ? left : 0L,
+                   _csDeferSinceMs ? " (waiting for a session the switch would cut)" : "");
     }
+    if (_csHostMoveCh)
+        out.printf("  the host is applying the move to channel %u (%lu s ago) - it has not restarted yet\n",
+                   _csHostMoveCh, (unsigned long)((now - _csHostMoveMs) / 1000UL));
     uint8_t who = 0;
     if (_csMemberMissing(now, &who))
         out.printf("  missing: WCB%u%s\n", who,
-                   _csTrigArmMs ? "" : " (a search needs 10 s of this, 40 s after boot)");
-    out.printf("  searches: %lu since boot; %u of %u attempts used on the current trigger\n",
+                   _csSched ? "" : " (a search needs 10 s of this, 40 s after boot)");
+    out.printf("  searches: %lu since boot; %u of %u attempts used on the current trigger",
                (unsigned long)_csSearches, _csAttempt, (unsigned)chansync::SEARCH_ATTEMPTS);
+    if (_csSched && _csAttempt < chansync::SEARCH_ATTEMPTS) {
+        const long due = (long)(_csNextDueMs - now);
+        out.printf("; the next is due in %ld s", due > 0 ? due / 1000L : 0L);
+    }
+    out.println();
     for (uint8_t id = 1; id <= WCB_MAX_BOARDS; id++) {
         if (id == _deviceID || !_csHeard(id, now)) continue;
         portENTER_CRITICAL(&_csMux);
@@ -3530,7 +3587,12 @@ void WCB_Client::_csReset() {
     portEXIT_CRITICAL(&_csMux);
     _csOffHome      = false;
     _csBusyMs       = 0;
+    _csRawRxMs      = 0;
+    _csBootSolicited = false;
     _csMovePending  = false;
+    _csDeferSinceMs = 0;
+    _csHostMoveCh   = 0;
+    _csHeldValid    = false;
     _csAnnLeft      = 0;
     _csReplyPending = false;
     _csSeenSender   = 0;
@@ -3539,9 +3601,7 @@ void WCB_Client::_csReset() {
     _csHomeCh       = 0;
     _csVisitCh      = 0;
     _csSearchNowReq = false;
-    _csTrigSinceMs  = 0;
-    _csTrigArmMs    = 0;
-    _csAttempt      = 0;
+    _csResetTrigger();
     _csLastEvalMs   = 0;
     for (int c = 0; c <= chansync::MAX_CHANNEL_CAP; c++) _csFound[c] = chansync::noKey();
     memset(_csPullMask, 0, sizeof(_csPullMask));
@@ -3580,8 +3640,8 @@ chansync::Key WCB_Client::_csSelfKey() const {
 
 // A neighbor's key: from its latest CHAN TLV, or - for firmware older than channel sync -
 // derived as docs/CHANNEL_SYNC.md §2 says: a WCB's rank is its number, a client's
-// 100 + id, unpinned, sync off. With no advert at all there is no telling a client from a
-// WCB, except at the controller slot.
+// 100 + id, a temporary peer never leads; unpinned, sync off (the firmware's keyOf). With no
+// advert at all there is no telling a client from a WCB, except at the controller slot.
 chansync::Key WCB_Client::_csKeyOf(uint8_t id) const {
     chansync::Key k;
     k.id = id;
@@ -3595,8 +3655,9 @@ chansync::Key WCB_Client::_csKeyOf(uint8_t id) const {
         return k;
     }
     const WCBNeighbor& nb = _neighbors[id - 1];
-    const bool client = (nb.valid && nb.isClient) || id == _specialPeerID || id == WCB_SPECIAL_ID;
-    k.rank  = client ? (uint8_t)(chansync::RANK_CLIENT_BASE + id) : id;
+    const bool temporary = (nb.valid && nb.temporary) || (_csNeverMiss & (1UL << (id - 1)));
+    const bool client    = (nb.valid && nb.isClient) || id == _specialPeerID || id == WCB_SPECIAL_ID;
+    k.rank  = temporary ? chansync::RANK_NEVER : (client ? (uint8_t)(chansync::RANK_CLIENT_BASE + id) : id);
     k.flags = 0;
     return k;
 }
@@ -3610,13 +3671,19 @@ bool WCB_Client::_csHeard(uint8_t id, unsigned long now) const {
     return t != 0 && (now - t) < window;
 }
 
-// The best device this one hears, ITSELF INCLUDED (what judgeMove and shouldSearch take).
+// The best device this one hears, ITSELF INCLUDED (what judgeMove and shouldSearch take,
+// what a REPLY names, and who the leader checks compare with) - among those that TAKE PART
+// (F_SYNC), exactly as the WCB firmware's look() picks it (WCB_ChanSync.cpp). A device with
+// sync off, or firmware older than channel sync (a derived key, SYNC off), cannot move or
+// search: a group led by it would never look for a stray board and would refuse every MOVE
+// but its own. Counting it here split mixed fleets - this device deferring to a leader the
+// boards themselves do not have. It is still heard (the pinned check in chanSyncMove).
 chansync::Key WCB_Client::_csBestPresent(unsigned long now, uint8_t exclude) const {
     chansync::Key best = _csSelfKey();
     for (uint8_t id = 1; id <= WCB_MAX_BOARDS; id++) {
         if (id == _deviceID || id == exclude || !_csHeard(id, now)) continue;
         const chansync::Key k = _csKeyOf(id);
-        if (chansync::better(k, best)) best = k;
+        if ((k.flags & chansync::F_SYNC) && chansync::better(k, best)) best = k;
     }
     return best;
 }
@@ -3624,27 +3691,117 @@ chansync::Key WCB_Client::_csBestPresent(unsigned long now, uint8_t exclude) con
 // A board this device knows of is missing: a member of its peer set - the floor
 // (1..wcb_quantity), a learned peer, the special peer - that the heartbeat sweep has
 // marked offline (or that has not been heard since boot). Temporary peers and rank-255
-// devices are never missed: nobody searches for a relay.
+// devices are never missed: nobody searches for a relay. That is _csNeverMiss, not the
+// neighbor record: the record that says "temporary" ages out (50 s / 180 s) exactly when
+// the device has gone, and after a reboot it is not there at all, so a relay switched off
+// at a floor id would cost seven searches after every boot.
 bool WCB_Client::_csMemberMissing(unsigned long now, uint8_t* who) const {
     (void)now;
+    const uint32_t never = _csNeverMiss;
     for (uint8_t i = 0; i < WCB_MAX_BOARDS; i++) {
         const uint8_t id = (uint8_t)(i + 1);
         if (id == _deviceID) continue;
         const bool member = i < _quantity || _learnedPeer[i] || (_specialPeerID && id == _specialPeerID);
         if (!member) continue;
-        if (_neighbors[i].valid && _neighbors[i].temporary) continue;
-        portENTER_CRITICAL(&_csMux);
-        const bool never = _csPeer[i].has && _csPeer[i].f.rank == chansync::RANK_NEVER;
-        portEXIT_CRITICAL(&_csMux);
-        if (never) continue;
+        if (never & (1UL << i)) continue;
+        if (_neighbors[i].valid && _neighbors[i].temporary) continue;   // (the RX task sets the bit with it)
         if (!_boards[i].online) { if (who) *who = id; return true; }
     }
     return false;
 }
 
+// The never-missed ids live beside the learned peers in "wcb_peers", under the same octet
+// fingerprint _loadLearnedPeers checks (a different network wipes the namespace). Loop
+// task only (NVS); the RX task only flips bits and sets _csNeverMissDirty.
+void WCB_Client::_csSaveNeverMiss() {
+    Preferences prefs;
+    if (!prefs.begin("wcb_peers", false)) return;
+    prefs.putUChar("ver", 1);                 // the fingerprint _loadLearnedPeers keys on, as _saveLearnedPeers writes it
+    prefs.putUChar("o2", _oct2);
+    prefs.putUChar("o3", _oct3);
+    prefs.putUInt("csnever", _csNeverMiss);
+    prefs.end();
+}
+
+void WCB_Client::_csLoadNeverMiss() {
+    Preferences prefs;
+    if (!prefs.begin("wcb_peers", true)) return;
+    const bool ours = prefs.getUChar("o2", 0) == _oct2 && prefs.getUChar("o3", 0) == _oct3;
+    const uint32_t m = prefs.getUInt("csnever", 0);
+    prefs.end();
+    if (ours) _csNeverMiss = _csNeverMiss | m;   // OR: the receive callback is live already and may have set a bit
+}
+
 bool WCB_Client::_csSoftApUp() const {
     const wifi_mode_t m = WiFi.getMode();
     return m == WIFI_MODE_AP || m == WIFI_MODE_APSTA;
+}
+
+// An interface that owns the radio's channel: a SoftAP up, or the STA associated with an
+// access point. Either way esp_wifi_set_channel is not ours to call (IDF: not with the STA
+// connected; an AP moves only by restarting), so a move needs the host (onChannelMove).
+bool WCB_Client::_csIfaceUp(const char** why) const {
+    if (_csSoftApUp()) { if (why) *why = "a SoftAP"; return true; }
+    const wifi_mode_t m = WiFi.getMode();
+    if (m == WIFI_MODE_STA) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) { if (why) *why = "a WiFi association"; return true; }
+    }
+    return false;
+}
+
+// What a live switch would cut, so it waits (at most chansync::MOVE_DEFER_MAX_MS): the
+// sessions _csQuiet() also waits for - a fragmented send, a bulk transfer, a sequence
+// request, a sent command awaiting its ACK - and raw packets still arriving (an OTA, a
+// config pull through WcbMgmt). Not this device's own command or servo traffic: the rest
+// of the mesh has switched at the same instant, so that traffic reaches nobody here, and
+// holding the radio for it would only strand the device (the firmware's applyMove waits for
+// sessions, not traffic, WCB.ino chanSyncHostBusy).
+bool WCB_Client::_csMoveBusy(unsigned long now, const char** why) {
+    const char* w = nullptr;
+    if (_fragJob.active)      w = "a fragmented send";
+    else if (_bulkRx.active)  w = "a bulk transfer";
+    else if (_seqPending)     w = "a sequence request";
+    else {
+        const unsigned long raw = _csRawRxMs;
+        if (raw && now - raw < WCB_CHSYNC_QUIET_MS) w = "raw packets arriving (an OTA or a config pull)";
+    }
+    if (!w) {
+        portENTER_CRITICAL(&_pendingMux);
+        for (int i = 0; i < WCB_PENDING_MAX && !w; i++)
+            if (_pending[i].active) w = "a sent command awaiting its ACK";
+        portEXIT_CRITICAL(&_pendingMux);
+    }
+    if (why) *why = w;
+    return w != nullptr;
+}
+
+// The neighbors' CHAN facts have had time to arrive: the boot SOLICIT goes out with the
+// first boot advert, and every WCB answers it within 0.6 s.
+bool WCB_Client::_csViewSettled(unsigned long now) const {
+    return now - _csBootMs >= WCB_CHSYNC_VIEW_SETTLE_MS;
+}
+
+// Forget the schedule outright: begin(), a move, sync turned off, or a condition that has
+// stayed clear WCB_CHSYNC_TRIGGER_RESET_MS (the firmware's resetTrigger).
+void WCB_Client::_csResetTrigger() {
+    _csTrigSinceMs = 0;
+    _csSched       = false;
+    _csAttempt     = 0;
+    _csNextDueMs   = 0;
+    _csClearedMs   = 0;
+    _csGaveUpSaid  = false;
+}
+
+// A search is over and the radio is home. A MOVE heard at home meanwhile (an operator move
+// made during the search, say) is judged now, with the time it has waited off its countdown
+// (_csHandleMove schedules from its arrival): left unjudged, this device's next search would
+// find its group gone and pull it back.
+void WCB_Client::_csEndSearch(unsigned long now) {
+    _csSearch = CS_SEARCH_IDLE;
+    if (!_csHeldValid) return;
+    _csHeldValid = false;
+    _csHandleMove(_csHeld, now);
 }
 
 // Can the radio leave its channel for a search without breaking a WiFi link? IDF:
@@ -3775,9 +3932,19 @@ void WCB_Client::_csHandleFrame(const CsFrame& f, unsigned long now) {
             // The responder says which channel it is on, so a reply drained after the radio
             // moved on is still credited to the right channel.
             if (!chansync::validChannel(r.channel, chansync::MAX_CHANNEL_CAP) || r.channel == _csHomeCh) break;
+            // Credit the best the reply names, and the responder itself ("itself included"),
+            // as the firmware's onReply does. A responder that still lists THIS device as
+            // heard (its offline sweep has not run yet) can name it as the best: that is not
+            // who leads over there, and judgeSearch would compare this device with itself
+            // and neither go nor pull - so the responder's own key stands in for it.
+            chansync::Key responder;
+            responder.id    = f.sender;
+            responder.rank  = r.rank;
+            responder.flags = (uint8_t)(r.flags & (chansync::F_PINNED | chansync::F_SYNC));
             chansync::Key k = r.best;
-            if (k.id == 0 || k.id > WCB_MAX_BOARDS) { k.id = f.sender; k.rank = r.rank; k.flags = r.flags; }
-            if (k.id == _deviceID) break;                                       // a duplicate id, not a leader
+            k.flags = (uint8_t)(k.flags & (chansync::F_PINNED | chansync::F_SYNC));
+            if (k.id == 0 || k.id > WCB_MAX_BOARDS || k.id == _deviceID) k = chansync::noKey();
+            if (chansync::better(responder, k)) k = responder;
             if (chansync::better(k, _csFound[r.channel])) _csFound[r.channel] = k;
             break;
         }
@@ -3790,10 +3957,15 @@ void WCB_Client::_csHandleMove(const CsFrame& f, unsigned long now) {
     if (!chansync::decodeMove(f.data, sizeof(f.data), m)) return;
     // The first frame of a move decides; its repeats are ignored, accepted or not.
     if (f.sender == _csSeenSender && m.moveId == _csSeenMoveId && now - _csSeenMs < WCB_CHSYNC_DEDUP_MS) return;
+    // Heard at home while a search is under way (one heard away never reaches here - the RX
+    // task drops it): the search decides for the group first, and this one is judged when it
+    // is over (_csEndSearch). Not recorded as seen until then, or that judgement would never
+    // come. The latest one is kept.
+    if (_csSearch != CS_SEARCH_IDLE) { _csHeld = f; _csHeldValid = true; return; }
     _csSeenSender = f.sender;
     _csSeenMoveId = m.moveId;
     _csSeenMs     = now;
-    if (_csSearch != CS_SEARCH_IDLE) return;       // heard abroad: never obeyed (the RX task drops them anyway)
+    if (_csHostMoveCh) return;                     // the host is restarting onto a move already taken
 
     chansync::Key sender;
     sender.id    = f.sender;
@@ -3809,23 +3981,42 @@ void WCB_Client::_csHandleMove(const CsFrame& f, unsigned long now) {
     }
     // Never longer than a first frame's countdown, whatever a frame claims.
     const unsigned long waitMs = m.delayMs > chansync::MOVE_COUNTDOWN_MS ? chansync::MOVE_COUNTDOWN_MS : m.delayMs;
-    _csAnnLeft     = 0;                            // an own announce is superseded by a better sender's
-    _csMovePending = true;
-    _csMoveCh      = m.newChannel;
-    _csMoveAtMs    = f.rxMs + waitMs;
+    _csAnnLeft      = 0;                           // an own announce is superseded by a better sender's
+    _csMovePending  = true;
+    _csDeferSinceMs = 0;
+    _csMoveCh       = m.newChannel;
+    _csMoveAtMs     = f.rxMs + waitMs;
     Serial.printf("[WCB_Client] channel sync: WCB%u (rank %u%s) moves the mesh to channel %u - switching in %lu ms\n",
                   f.sender, m.rank, (m.flags & chansync::MF_OPERATOR) ? ", operator" : "", m.newChannel, waitMs);
 }
 
-// The switch. The host decides first; the library switches live only with no SoftAP.
+// The switch. The host decides first; the library switches live only with no SoftAP up and
+// no STA association (either owns the channel; esp_wifi_set_channel is not ours to call).
 void WCB_Client::_csApplyMove(uint8_t ch, unsigned long now) {
     if (_csMoveCb && _csMoveCb(ch)) {
+        // Applied live inside the callback (setMeshChannel(ch), no SoftAP): it has arrived.
+        uint8_t primary = 0;
+        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        if (_meshChannel == ch && esp_wifi_get_channel(&primary, &second) == ESP_OK && primary == ch) {
+            _csArrived(ch, now);
+            Serial.printf("[WCB_Client] channel sync: now on channel %u (the host applied it)\n", ch);
+            return;
+        }
+        // The host restarts onto ch. Until it does this device is LEAVING, not home: it
+        // starts no search (which would find its group gone and pull it back), announces
+        // and follows no other move, and says so loudly if the restart never comes (_csTick).
+        _csHostMoveCh = ch;
+        _csHostMoveMs = now ? now : 1;
+        _csHostWarnMs = _csHostMoveMs;
+        _csAnnLeft    = 0;
+        _csResetTrigger();
         Serial.printf("[WCB_Client] channel sync: the mesh is moving to channel %u - the host applies it\n", ch);
         return;
     }
-    if (_csSoftApUp()) {
-        Serial.printf("[WCB_Client] channel sync: cannot move to channel %u - a SoftAP owns this radio's channel and "
-                      "the host did not apply the move (onChannelMove); staying on channel %u\n", ch, currentChannel());
+    const char* w = nullptr;
+    if (_csIfaceUp(&w)) {
+        Serial.printf("[WCB_Client] channel sync: cannot move to channel %u - %s owns this radio's channel and "
+                      "the host did not apply the move (onChannelMove); staying on channel %u\n", ch, w, currentChannel());
         return;
     }
     if (!_csSetRadio(ch)) {
@@ -3843,9 +4034,7 @@ void WCB_Client::_csArrived(uint8_t ch, unsigned long now) {
     _lastWarnedChannel = 0;
     for (int i = 0; i < WCB_MAX_BOARDS; i++) _csHeardMs[i] = 0;   // heard on the old channel
     _csReplyPending = false;
-    _csTrigSinceMs  = 0;                           // a fresh trigger on the new channel
-    _csTrigArmMs    = 0;
-    _csAttempt      = 0;
+    _csResetTrigger();                             // a fresh trigger on the new channel
     // A channel change is not a dead radio: no verdict until the boards have had time to be
     // heard here, and the ones that stayed behind have dropped out of the judges.
     _txwdSentMs = 0;
@@ -3872,8 +4061,9 @@ void WCB_Client::_csStartSearch(unsigned long now, bool manual, uint8_t missingI
     else
         Serial.printf("[WCB_Client] channel sync: WCB%u is missing - searching channels 1-%u from channel %u "
                       "(attempt %u of %u)\n", missingId, _csMaxCh, _csHomeCh, _csAttempt, (unsigned)chansync::SEARCH_ATTEMPTS);
-    _csSearch  = CS_SEARCH_VISIT;
-    _csOffHome = true;                             // from here the RX task drops all but REPLYs
+    // _csOffHome is set by _csSearchStep just before the radio leaves: until then this device
+    // is home, and a MOVE heard meanwhile is held for after the search, not dropped.
+    _csSearch = CS_SEARCH_VISIT;
 }
 
 void WCB_Client::_csGoHome() {
@@ -3896,10 +4086,11 @@ void WCB_Client::_csSearchStep(unsigned long now) {
             return;
         }
         _csVisitCh = ch;
+        _csOffHome = true;                         // before the switch: nothing heard there is taken for home
         if (!_csSetRadio(ch)) {
             _csGoHome();
-            _csSearch = CS_SEARCH_IDLE;
             Serial.println("[WCB_Client] channel sync: search abandoned");
+            _csEndSearch(now);
             return;
         }
         const chansync::Key self = _csSelfKey();
@@ -3924,15 +4115,16 @@ void WCB_Client::_csSearchStep(unsigned long now) {
         do { ch++; } while (ch <= chansync::MAX_CHANNEL_CAP && !_csPullMask[ch]);
         if (ch > chansync::MAX_CHANNEL_CAP) {      // every worse group told
             _csGoHome();
-            _csSearch = CS_SEARCH_IDLE;
             Serial.printf("[WCB_Client] channel sync: back on channel %u\n", _csHomeCh);
+            _csEndSearch(now);
             return;
         }
         _csVisitCh = ch;
+        _csOffHome = true;
         if (!_csSetRadio(ch)) {
             _csGoHome();
-            _csSearch = CS_SEARCH_IDLE;
             Serial.println("[WCB_Client] channel sync: pull abandoned");
+            _csEndSearch(now);
             return;
         }
         _csStartFrames(_csHomeCh, _csSelfKey().flags, chansync::PULL_REPEATS, chansync::PULL_REPEAT_GAP_MS,
@@ -3947,21 +4139,24 @@ void WCB_Client::_csSearchDone(unsigned long now) {
     const chansync::Key self = _csSelfKey();
     const chansync::SearchResult r = chansync::judgeSearch(self, _csHomeCh, _csFound);
     if (r.moveTo) {
-        const chansync::Key& k = _csFound[r.moveTo];
-        _csSearch = CS_SEARCH_IDLE;
-        if (_csSoftApUp() && !_csMoveCb) {
+        const chansync::Key k = _csFound[r.moveTo];
+        const char* w = nullptr;
+        if (_csIfaceUp(&w) && !_csMoveCb) {
             Serial.printf("[WCB_Client] channel sync: WCB%u (rank %u) leads on channel %u, but this device cannot "
-                          "follow - a SoftAP owns its channel and no onChannelMove() applies a move\n",
-                          k.id, k.rank, r.moveTo);
+                          "follow - %s owns its channel and no onChannelMove() applies a move\n",
+                          k.id, k.rank, r.moveTo, w);
+            _csEndSearch(now);
             return;
         }
         Serial.printf("[WCB_Client] channel sync: WCB%u (rank %u) leads on channel %u - taking this group there\n",
                       k.id, k.rank, r.moveTo);
         _csStartFrames(r.moveTo, self.flags, chansync::MOVE_REPEATS, chansync::MOVE_REPEAT_GAP_MS,
                        chansync::MOVE_COUNTDOWN_MS, now);
-        _csMovePending = true;
-        _csMoveCh      = r.moveTo;
-        _csMoveAtMs    = _csAnnSwitchMs;
+        _csMovePending  = true;
+        _csDeferSinceMs = 0;
+        _csMoveCh       = r.moveTo;
+        _csMoveAtMs     = _csAnnSwitchMs;
+        _csEndSearch(now);                         // a MOVE held meanwhile from a better sender supersedes it
         return;
     }
     if (r.pullCount) {
@@ -3975,12 +4170,11 @@ void WCB_Client::_csSearchDone(unsigned long now) {
         _csVisitCh    = 0;
         _csAnnLeft    = 0;
         _csDwellEndMs = now;
-        _csOffHome    = true;
-        return;
+        return;                                    // _csSearchStep takes the radio away for each pull
     }
-    _csSearch = CS_SEARCH_IDLE;
     Serial.printf("[WCB_Client] channel sync: nobody answered on the other channels - staying on channel %u\n",
                   _csHomeCh);
+    _csEndSearch(now);
 }
 
 // The whole state machine, first thing in update() (loop task).
@@ -3989,6 +4183,9 @@ void WCB_Client::_csTick(unsigned long now) {
     CsFrame f;
     while (_csPop(f)) _csHandleFrame(f, now);
 
+    // The never-missed set changed on the RX task: save it here (NVS), while the radio is home.
+    if (_csNeverMissDirty && _csSearch == CS_SEARCH_IDLE) { _csNeverMissDirty = false; _csSaveNeverMiss(); }
+
     // 2. Turned off (live): unwind whatever is in flight, here on the loop task.
     if (!_csEnabled) {
         if (_csSearch != CS_SEARCH_IDLE) {
@@ -3996,29 +4193,52 @@ void WCB_Client::_csTick(unsigned long now) {
             _csSearch = CS_SEARCH_IDLE;
             Serial.println("[WCB_Client] channel sync: off - search abandoned");
         }
+        _csHeldValid    = false;
         _csMovePending  = false;
+        _csDeferSinceMs = 0;
         _csAnnLeft      = 0;
         _csReplyPending = false;
         _csSearchNowReq = false;
-        _csTrigSinceMs  = 0;
-        _csTrigArmMs    = 0;
-        _csAttempt      = 0;
+        _csResetTrigger();
         return;
     }
 
     // 3. A search owns the radio until it is home.
     if (_csSearch != CS_SEARCH_IDLE) { _csSearchStep(now); return; }
 
+    // 3b. The host took a move and has not restarted: this device is leaving and does
+    //     nothing that assumes it stays. If the restart never comes, say so - loudly.
+    if (_csHostMoveCh && now - _csHostWarnMs >= WCB_CHSYNC_HOST_MOVE_MS) {
+        _csHostWarnMs = now;
+        Serial.printf("[WCB_Client] *** channel sync: the host took the move to channel %u %lu s ago and has not "
+                      "restarted - this device is still on channel %u, OFF THE MESH ***\n", _csHostMoveCh,
+                      (unsigned long)((now - _csHostMoveMs) / 1000UL), currentChannel());
+    }
+
     // 4. MOVE frames this device is announcing at home.
     if (_csAnnLeft && (long)(now - _csAnnNextMs) >= 0) _csSendMoveFrame(now);
 
-    // 5. The switch. A fragmented send in flight (~0.5 s at most) finishes first; the
-    //    move is never held past MOVE_DEFER_MAX_MS.
-    if (_csMovePending && (long)(now - _csMoveAtMs) >= 0 &&
-        !(_fragJob.active && (long)(now - _csMoveAtMs) < (long)chansync::MOVE_DEFER_MAX_MS)) {
-        _csMovePending = false;
-        _csAnnLeft     = 0;
-        _csApplyMove(_csMoveCh, now);
+    // 5. The switch. A live channel change cuts whatever session is in flight, so it waits
+    //    for one (_csMoveBusy) - never past MOVE_DEFER_MAX_MS, as on a WCB (applyMove).
+    if (_csMovePending && (long)(now - _csMoveAtMs) >= 0) {
+        const char* w = nullptr;
+        bool hold = false;
+        if (_csMoveBusy(now, &w)) {
+            if (!_csDeferSinceMs) {
+                _csDeferSinceMs = now ? now : 1;
+                Serial.printf("[WCB_Client] channel sync: the move to channel %u waits for %s (at most %lu s)\n",
+                              _csMoveCh, w, (unsigned long)(chansync::MOVE_DEFER_MAX_MS / 1000UL));
+            }
+            if (now - _csDeferSinceMs < chansync::MOVE_DEFER_MAX_MS) hold = true;
+            else Serial.printf("[WCB_Client] channel sync: %s still after %lu s - moving anyway\n", w,
+                               (unsigned long)(chansync::MOVE_DEFER_MAX_MS / 1000UL));
+        }
+        if (!hold) {
+            _csMovePending  = false;
+            _csDeferSinceMs = 0;
+            _csAnnLeft      = 0;
+            _csApplyMove(_csMoveCh, now);
+        }
     }
 
     // 6. A REPLY owed to a PROBE: the best device heard here, itself included, the
@@ -4038,10 +4258,17 @@ void WCB_Client::_csTick(unsigned long now) {
         if (n) _csSendFrame(chansync::PT_PROBE_REPLY, b, n);
     }
 
+    // 6b. The boot SOLICIT for a device with no identity (with one, _wdpTick sends it after
+    //     the first boot advert): the neighbors' CHAN facts now, not at their next 60 s advert.
+    if (!_csBootSolicited && !_wdpType[0] && now - _csBootMs >= 1500) {
+        _csBootSolicited = true;
+        _sendWdpSolicit();
+    }
+
     // 7. Whether to search: four times a second is plenty.
     if (now - _csLastEvalMs < 250) return;
     _csLastEvalMs = now;
-    if (_csMovePending || _csAnnLeft) return;
+    if (_csMovePending || _csAnnLeft || _csHostMoveCh) return;
 
     const char* why = nullptr;
     if (_csSearchNowReq) {
@@ -4054,33 +4281,66 @@ void WCB_Client::_csTick(unsigned long now) {
         } else if (_csQuiet(now, &why)) {
             _csSearchNowReq = false;
             _csStartSearch(now, true, 0);
-            _csTrigArmMs = now ? now : 1;          // ?CHSYNC,SEARCH re-arms the schedule
-            _csAttempt   = 1;
+            // A requested search restarts the schedule: if a board is still missing, the next
+            // attempts follow from here (the firmware's ?CHSYNC,SEARCH).
+            _csSched       = true;
+            _csAttempt     = 1;
+            _csNextDueMs   = now + (chansync::searchAttemptOffsetMs(1) - chansync::searchAttemptOffsetMs(0));
+            _csTrigSinceMs = now ? now : 1;
+            _csClearedMs   = 0;
+            _csGaveUpSaid  = false;
             return;
         } else if (now - _csSearchNowMs >= chansync::MOVE_DEFER_MAX_MS) {
             _csSearchNowReq = false;
             Serial.printf("[WCB_Client] channel sync: search not run - not quiet for %lu s (%s)\n",
                           (unsigned long)(chansync::MOVE_DEFER_MAX_MS / 1000UL), why);
         }
+        if (_csSearchNowReq) return;               // still waiting for quiet
     }
 
-    if (now - _csBootMs < chansync::BOOT_GRACE_MS) return;   // presence has to settle first
+    // The trigger, as the WCB firmware's evaluateTrigger: only a group's leader that misses
+    // a known board, not in the boot grace, once the condition has held TRIGGER_STABLE_MS.
+    // canHop is passed as true and checked when an attempt is due instead: a SoftAP whose
+    // phone comes and goes would otherwise restart the schedule every time.
     uint8_t who = 0;
     const bool missing = _csMemberMissing(now, &who);
-    // canHop is passed as true here and checked when an attempt is due instead: a SoftAP
-    // whose phone comes and goes would otherwise restart the schedule every time, and
-    // turn seven searches an hour into one per reconnect.
-    const bool cond = chansync::shouldSearch(_csSelfKey(), _csBestPresent(now), missing, _csEnabled, true);
-    if (!cond) { _csTrigSinceMs = 0; _csTrigArmMs = 0; _csAttempt = 0; return; }
-    if (!_csTrigSinceMs) _csTrigSinceMs = now ? now : 1;
-    if (!_csTrigArmMs) {
-        if (now - _csTrigSinceMs < chansync::TRIGGER_STABLE_MS) return;
-        _csTrigArmMs = now ? now : 1;
-        _csAttempt   = 0;
+    const bool cond = now - _csBootMs >= chansync::BOOT_GRACE_MS &&
+                      chansync::shouldSearch(_csSelfKey(), _csBestPresent(now), missing, _csEnabled, true);
+    if (!cond) {
+        _csTrigSinceMs = 0;
+        // A condition back within WCB_CHSYNC_TRIGGER_RESET_MS carries on the schedule it had: a
+        // member that flaps offline and online would otherwise restart seven attempts each time.
+        if (_csSched) {
+            if (!_csClearedMs) _csClearedMs = now ? now : 1;
+            else if (now - _csClearedMs >= WCB_CHSYNC_TRIGGER_RESET_MS) _csResetTrigger();
+        }
+        return;
     }
-    if (_csAttempt >= chansync::SEARCH_ATTEMPTS) return;     // done until reboot, a request, or a new trigger
-    if (now - _csTrigArmMs < chansync::searchAttemptOffsetMs(_csAttempt)) return;
+    _csClearedMs = 0;
+    if (!_csTrigSinceMs) _csTrigSinceMs = now ? now : 1;
+    if (!_csSched) {                               // a new episode
+        _csSched      = true;
+        _csAttempt    = 0;
+        _csNextDueMs  = _csTrigSinceMs + chansync::TRIGGER_STABLE_MS;
+        _csGaveUpSaid = false;
+    } else if ((long)(_csNextDueMs - (_csTrigSinceMs + chansync::TRIGGER_STABLE_MS)) < 0) {
+        _csNextDueMs = _csTrigSinceMs + chansync::TRIGGER_STABLE_MS;   // back after a short clear: it must hold again
+    }
+    if (_csAttempt >= chansync::SEARCH_ATTEMPTS) {
+        if (!_csGaveUpSaid) {
+            _csGaveUpSaid = true;
+            Serial.printf("[WCB_Client] channel sync: WCB%u is still missing after %u searches - not searching again "
+                          "until the next boot, chanSyncSearchNow(), or it has been back for %lu minutes\n", who,
+                          (unsigned)chansync::SEARCH_ATTEMPTS, (unsigned long)(WCB_CHSYNC_TRIGGER_RESET_MS / 60000UL));
+        }
+        return;
+    }
+    if ((long)(now - _csNextDueMs) < 0) return;
     if (!_csCanHop(nullptr) || !_csQuiet(now, nullptr)) return;   // due: go as soon as it can
+    // Re-based on when this attempt really starts: one held up for a while (a station on the
+    // AP, a busy device) is not followed at once by the next, whose offset has also passed.
     _csAttempt++;
+    if (_csAttempt < chansync::SEARCH_ATTEMPTS)
+        _csNextDueMs = now + (chansync::searchAttemptOffsetMs(_csAttempt) - chansync::searchAttemptOffsetMs(_csAttempt - 1));
     _csStartSearch(now, false, who);
 }

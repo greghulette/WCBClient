@@ -127,8 +127,9 @@
     session is sent "[AUTH:REQUIRED]" and gets no output, and runs nothing, until it
     sends "?AUTH,<token>": "[AUTH:OK]" and it is in for the life of the session, or
     "[AUTH:FAIL]" and it is closed (and every ?AUTH fails for 1 s after a failure).
-    Any other line before that is dropped and answered "[AUTH:REQUIRED]". With no
-    token, nothing changes, and "?AUTH,<anything>" answers "[AUTH:OK]".
+    Any other line before that is dropped and answered "[AUTH:REQUIRED]". A session
+    that has not logged in within 10 s is closed. With no token, nothing changes, and
+    "?AUTH,<anything>" answers "[AUTH:OK]".
 
     This is deliberately the same transport NaviCore exposes (its docs/PROTOCOLS.md;
     same URI, same framing, same mirror semantics), so a host app writes ONE client
@@ -341,11 +342,19 @@ WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
 // has been QUIET for a moment. Quiet matters on its own: an ACK-paced push empties
 // the queue between every pair of commands, so "the queue is empty" is not the same
 // as "the sender has finished talking".
-static uint32_t relayRebootAtMs = 0;             // 0 = nothing pending
-static const uint32_t REBOOT_QUIET_MS = 1200;
+//
+// BUT NOT FOR EVER: REBOOT_MAX_DEFER_MS caps it, as the firmware's RESTART_MAX_DEFER_MS
+// does (20 s). A client that sends a line every second - a terminal re-arming, a tool
+// polling - would otherwise hold the restart off for good, and a channel-sync move that
+// waits on this restart would leave the relay on the old channel with the mesh gone.
+static uint32_t relayRebootAtMs    = 0;          // 0 = nothing pending
+static uint32_t relayRebootAskedMs = 0;          // when the first request of this restart came
+static const uint32_t REBOOT_QUIET_MS     = 1200;
+static const uint32_t REBOOT_MAX_DEFER_MS = 20000;
 
 static void relayRequestReboot(const char* why) {
   host.printf("[relay] %s - rebooting to apply.\n", why);
+  if (!relayRebootAtMs) relayRebootAskedMs = millis();
   relayRebootAtMs = millis() + REBOOT_QUIET_MS;
 }
 
@@ -355,7 +364,9 @@ static void relayRebootDefer() {
 }
 
 static void relayRebootService() {
-  if (relayRebootAtMs && (int32_t)(millis() - relayRebootAtMs) >= 0) {
+  if (!relayRebootAtMs) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - relayRebootAtMs) >= 0 || now - relayRebootAskedMs >= REBOOT_MAX_DEFER_MS) {
     Serial.flush();          // the WebSocket sink cannot survive the restart; USB can
     ESP.restart();
   }

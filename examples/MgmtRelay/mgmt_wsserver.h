@@ -48,7 +48,14 @@
 //  any failure every ?AUTH on any session fails - one guess a second. With no token,
 //  nothing is sent on open and "?AUTH,<anything>" answers "[AUTH:OK]", so a client
 //  can always send it. A token set, changed or cleared applies to NEW sessions; one
-//  already logged in keeps going.
+//  already logged in keeps going. A session that has not logged in WS_LOGIN_MS (10 s)
+//  after it opened is closed, and when the slots are full a new one evicts a session
+//  that has not logged in before one that has.
+//  A SESSION IS ITS SERIAL, NOT ITS FD. lwIP gives a closed socket's number to the next
+//  connection - the LRU purge does exactly that under load - so a queued command or a
+//  mirror subscription keyed on the fd alone would pass to whoever connects next, signed
+//  in or not. Each queued line carries its session's serial; drain() runs it, and puts that
+//  session on the mirror, only while the same session is still open and logged in.
 //  The check runs here on the httpd task, inside feed(): it is a string compare,
 //  and doing it before the queue means a line from a session that has not logged in
 //  never reaches relaySerialLine() at all. The [AUTH:...] replies are owed per
@@ -140,9 +147,14 @@ inline const char* authArg(const char* s) {
   return nullptr;
 }
 
+// A session that has not logged in by then is closed (pumpNotes): a socket that never
+// sends ?AUTH must not hold one of the WS_MAX_CLIENTS slots for ever.
+static const uint32_t WS_LOGIN_MS = 10000;
+
 struct WsCmd {
-  int  fd;                    // client socket, for the async reply
-  char line[WS_LINE_MAX];     // NUL-terminated command
+  int      fd;                // client socket, for the async reply
+  uint32_t serial;            // the SESSION that sent it (WsAcc::serial): an fd number is reused
+  char     line[WS_LINE_MAX]; // NUL-terminated command
 };
 
 inline QueueHandle_t  wsQueue  = nullptr;
@@ -264,16 +276,23 @@ inline WsSink sink;
 // exactly this on hardware (two valid commands, zero replies). Eviction policy is
 // deliberately identical to WsSink::begin() so the two cannot drift.
 // It is also the SESSION: whether it has logged in, and the [AUTH:...] lines it is owed.
+// A session is its `serial`, never its fd: lwIP hands a closed socket's number to the next
+// connection (the LRU purge does exactly that under load), so anything keyed on the fd alone
+// - a queued command, a mirror subscription - would pass to whoever connects next.
 struct WsAcc {
-  int     fd  = -1;                // authMux (pump() reads it on the loop task)
-  size_t  len = 0;
-  bool    overrun = false;
-  bool    authed  = false;         // httpd task only: may run commands and see the mirror
-  bool    closing = false;         // [AUTH:FAIL] owed or sent: everything else from it is dropped (authMux)
-  uint8_t notes   = 0;             // NOTE_* owed, sent by pump() (authMux)
-  char    buf[WS_LINE_MAX];
+  int      fd  = -1;               // authMux (pump() reads it on the loop task)
+  uint32_t serial = 0;             // this session, unique since boot (authMux)
+  uint32_t openedMs = 0;           // when it opened: not logged in after WS_LOGIN_MS = closed
+  size_t   len = 0;
+  bool     overrun = false;
+  bool     authed  = false;        // may run commands and see the mirror (written under authMux)
+  bool     closing = false;        // [AUTH:FAIL] owed or sent, or its login timed out (pumpNotes): everything
+                                   // else from it is dropped (authMux)
+  uint8_t  notes   = 0;            // NOTE_* owed, sent by pump() (authMux)
+  char     buf[WS_LINE_MAX];
 };
-inline WsAcc accs[WS_MAX_CLIENTS];
+inline WsAcc    accs[WS_MAX_CLIENTS];
+inline uint32_t accSerial = 0;     // httpd task, under authMux: the last serial handed out
 
 inline WsAcc* accFor(int fd) {
   // A session that is not in the table yet is a new one: logged in only if there is no
@@ -281,45 +300,60 @@ inline WsAcc* accFor(int fd) {
   char tok[WS_TOKEN_MAX + 1];
   tokenCopy(tok);
   WsAcc* a = nullptr;
+  int evicted = -1;
   portENTER_CRITICAL(&authMux);
   for (int i = 0; i < WS_MAX_CLIENTS && !a; i++) if (accs[i].fd == fd) a = &accs[i];
   if (!a) {
     for (int i = 0; i < WS_MAX_CLIENTS && !a; i++) if (accs[i].fd < 0) a = &accs[i];
-    if (!a) a = &accs[0];          // full: evict the oldest
+    // Full (max_open_sockets matches, so only a session httpd has not closed yet): evict one
+    // that has not logged in before one that has.
+    for (int i = 0; i < WS_MAX_CLIENTS && !a; i++) if (!accs[i].authed) a = &accs[i];
+    if (!a) a = &accs[0];
+    if (a->fd >= 0) evicted = a->fd;
     a->fd = fd; a->len = 0; a->overrun = false;
+    if (++accSerial == 0) accSerial = 1;
+    a->serial = accSerial; a->openedMs = millis();
     a->authed = !tok[0]; a->closing = false; a->notes = 0;
   }
   portEXIT_CRITICAL(&authMux);
+  if (evicted >= 0) sink.drop(evicted);   // its record is gone: it is no longer known to be logged in
   return a;
 }
 inline void releaseAcc(int fd) {
   portENTER_CRITICAL(&authMux);
   for (int i = 0; i < WS_MAX_CLIENTS; i++)
     if (accs[i].fd == fd) {
-      accs[i].fd = -1; accs[i].len = 0; accs[i].overrun = false;
+      accs[i].fd = -1; accs[i].serial = 0; accs[i].len = 0; accs[i].overrun = false;
       accs[i].authed = false; accs[i].closing = false; accs[i].notes = 0;
     }
   portEXIT_CRITICAL(&authMux);
+}
+inline void setAuthed(WsAcc* a, bool on) {
+  portENTER_CRITICAL(&authMux);
+  a->authed = on;
+  portEXIT_CRITICAL(&authMux);
+}
+// The session a queued command came from, if it is still that session and logged in (loop
+// task, drain). The socket's fd alone proves nothing: it may be a new connection's now.
+inline bool sessionLive(int fd, uint32_t serial) {
+  bool live = false;
+  portENTER_CRITICAL(&authMux);
+  for (int i = 0; i < WS_MAX_CLIENTS; i++)
+    if (accs[i].fd == fd && accs[i].serial == serial && accs[i].authed && !accs[i].closing) live = true;
+  portEXIT_CRITICAL(&authMux);
+  return live;
 }
 inline void note(WsAcc* a, uint8_t bits) {
   portENTER_CRITICAL(&authMux);
   a->notes |= bits;
   portEXIT_CRITICAL(&authMux);
 }
-inline bool isClosing(int fd) {   // loop task (drain)
-  bool c = false;
-  portENTER_CRITICAL(&authMux);
-  for (int i = 0; i < WS_MAX_CLIENTS; i++) if (accs[i].fd == fd && accs[i].closing) c = true;
-  portEXIT_CRITICAL(&authMux);
-  return c;
-}
-
 // "?AUTH,<given>" from session `a` (httpd task).
 inline void authLine(WsAcc* a, const char* given) {
   char tok[WS_TOKEN_MAX + 1];
   tokenCopy(tok);
   if (!tok[0]) {                   // no token: always OK, so a client can always send it
-    a->authed = true;
+    setAuthed(a, true);
     sink.begin(a->fd);
     note(a, NOTE_OK);
     return;
@@ -328,13 +362,13 @@ inline void authLine(WsAcc* a, const char* given) {
   const bool     locked = authFailMs && (now - authFailMs) < AUTH_LOCKOUT_MS;
   const bool     match  = tokenEqual(given, tok);   // compared even when locked: the same work either way
   if (match && !locked) {
-    a->authed = true;
+    setAuthed(a, true);
     sink.begin(a->fd);
     note(a, NOTE_OK);
     return;
   }
   authFailMs = now ? now : 1;      // any failure locks every session out for AUTH_LOCKOUT_MS
-  a->authed  = false;
+  setAuthed(a, false);
   sink.drop(a->fd);
   portENTER_CRITICAL(&authMux);
   a->notes  |= NOTE_FAIL;          // pump() sends it, then closes the session
@@ -356,7 +390,8 @@ inline void feed(WsAcc* a, int fd, char c) {
     if (const char* given = authArg(a->buf)) { authLine(a, given); return; }
     if (!a->authed) { note(a, NOTE_REQUIRED); return; }            // dropped unrun
     WsCmd cmd;
-    cmd.fd = fd;
+    cmd.fd     = fd;
+    cmd.serial = a->serial;                                        // drain() runs it only for this session
     memcpy(cmd.line, a->buf, n + 1);
     if (!wsQueue) return;
     // Backpressure, not silent loss — see WS_ENQUEUE_WAIT_MS.
@@ -471,9 +506,13 @@ inline void drain() {
   if (!wsQueue) return;
   WsCmd cmd;
   if (xQueueReceive(wsQueue, &cmd, 0) != pdTRUE) return;
-  // Only a logged-in session's lines are queued. One that failed a later ?AUTH is
-  // closing: what it queued before still runs, but it is not put back on the mirror.
-  if (!isClosing(cmd.fd)) sink.begin(cmd.fd);   // ensure the reply reaches the client that asked
+  // Only a logged-in session's lines are queued, but the session may have ended since -
+  // closed, failed a later ?AUTH, or gone with its fd already handed to a new, signed-out
+  // connection. Its queued lines die with it (this is the purge on close), and nothing but
+  // the session that sent a line is ever put on the mirror for it: the mirror carries config
+  // pulls, the mesh password and this relay's own replies.
+  if (!sessionLive(cmd.fd, cmd.serial)) return;
+  sink.begin(cmd.fd);            // ensure the reply reaches the client that asked
   relaySerialLine(cmd.line);
 }
 
@@ -489,21 +528,27 @@ inline void sendTo(int fd, const char* line) {
 
 // The [AUTH:...] lines each session is owed, then the mirror. A [AUTH:FAIL] is sent
 // and then the session is closed: httpd_sess_trigger_close() queues the close on the
-// httpd task, behind the frame this task has just written.
+// httpd task, behind the frame this task has just written. A session that has not logged
+// in within WS_LOGIN_MS is closed too, so a silent socket cannot hold a slot.
 inline void pumpNotes() {
   if (!wsServer) return;
+  const uint32_t now = millis();
   for (int i = 0; i < WS_MAX_CLIENTS; i++) {
     int     fd;
     uint8_t n;
+    bool    stale;
     portENTER_CRITICAL(&authMux);
     fd = accs[i].fd;
     n  = accs[i].notes;
     accs[i].notes = 0;
+    stale = fd >= 0 && !accs[i].authed && !accs[i].closing && now - accs[i].openedMs >= WS_LOGIN_MS;
+    if (stale) accs[i].closing = true;
     portEXIT_CRITICAL(&authMux);
-    if (fd < 0 || !n) continue;
+    if (fd < 0) continue;
     if (n & NOTE_REQUIRED) sendTo(fd, "[AUTH:REQUIRED]\n");
     if (n & NOTE_OK)       sendTo(fd, "[AUTH:OK]\n");
     if (n & NOTE_FAIL)   { sendTo(fd, "[AUTH:FAIL]\n"); httpd_sess_trigger_close(wsServer, fd); }
+    else if (stale)        httpd_sess_trigger_close(wsServer, fd);
   }
 }
 

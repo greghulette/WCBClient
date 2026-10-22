@@ -135,6 +135,9 @@ constexpr uint8_t broadcast = 0;
 #define WCB_CHSYNC_QUIET_MS   3000UL  // a search waits this long after the last command / raw packet in or out
 #define WCB_CHSYNC_DEDUP_MS   5000UL  // a MOVE's moveId is remembered this long (its 5 frames span 1.2 s)
 #define WCB_CHSYNC_SETTLE_MS   150UL  // after a pull's last frame, before leaving that channel (ESP-NOW sends are queued)
+#define WCB_CHSYNC_TRIGGER_RESET_MS 600000UL  // a search condition clear this long starts a NEW schedule (firmware's TRIGGER_RESET_MS)
+#define WCB_CHSYNC_VIEW_SETTLE_MS     5000UL  // after begin(): the boot SOLICIT's adverts have landed (operator move waits)
+#define WCB_CHSYNC_HOST_MOVE_MS      60000UL  // a host that took a move and has not restarted: said loudly this often
 
 // ── Ensured-delivery (ETM) retransmit tuning ─────────────────────────────────
 // Applies ONLY to send()/broadcast() calls made with ensured=true. These values
@@ -489,12 +492,15 @@ struct WCBTxWatchStatus {
 // LOOP task, so NVS writes are safe inside it.
 //   channel : the mesh's new channel. Persist it either way, so the next boot
 //             starts there (setMeshChannel() before begin()).
-// Return true if the host applies the move itself: a SoftAP moves only by
-// restarting, so save, then restart from the host's own loop - never from inside
-// this callback. The library then leaves the radio alone.
+// Return true if the host applies the move itself: a SoftAP (or a STA joined to a
+// network) moves only by restarting, so save, then restart from the host's own loop -
+// never from inside this callback. The library then leaves the radio alone and treats
+// the device as leaving: no search, no other move, no operator move until the restart,
+// and a loud log line every WCB_CHSYNC_HOST_MOVE_MS while it has not happened. (A host
+// that applies it live instead, with no SoftAP, calls setMeshChannel(channel): that ends it.)
 // Return false and the library switches the radio live (esp_wifi_set_channel) -
-// possible only with no SoftAP up. With a SoftAP up and no callback (or false),
-// the library logs that it cannot move and stays.
+// possible only with no SoftAP up and no STA association. With either and no callback
+// (or false), the library logs that it cannot move and stays.
 typedef bool (*WCBChannelMoveCallback)(uint8_t channel);
 
 // Called for any received ESP-NOW packet whose size is NOT the standard
@@ -882,29 +888,42 @@ public:
     // (rank 255), a pinned one (a WCB joined to an access point) beats an unpinned
     // one, then the lower rank, then the lower id. WCB n has rank n; NaviCore sets
     // 0; any other client defaults to 100 + its device id. A WCB_Client device is
-    // never pinned. Advertised in WDP TLV 0x14 CHAN, so CALL setIdentity(): a
-    // device that sends no advert gets a derived key on the WCBs, as a WCB would.
+    // never pinned. Only a device that TAKES PART leads (its CHAN TLV has SYNC): one
+    // with sync off, or firmware older than channel sync (a derived key), cannot
+    // move or search, so it is heard but never anyone's leader - the WCB firmware's
+    // rule too. Advertised in WDP TLV 0x14 CHAN, so CALL setIdentity(): a device
+    // that sends no advert gets a derived key on the WCBs, and never leads. After
+    // begin() the library sends one WDP SOLICIT (after the first boot advert) so the
+    // neighbors' CHAN facts arrive in seconds, not at their next 60 s advert.
     //
     // MOVE (ETM packet type 25). The leader broadcasts "the mesh moves to channel
     // N" 5 times, 300 ms apart, switching 1.5 s after the first; every frame carries
     // the time left. A follower acts on the first frame of a move and obeys
     // (chansync::judgeMove) unless sync is off here, the channel is outside this
     // device's region, it is already there, or a device this one hears outranks the
-    // sender. At the switch, onChannelMove() decides how it is applied.
+    // sender. One heard at home while a search is under way is held and judged when
+    // the search is over. At the switch, onChannelMove() decides how it is applied;
+    // a live switch first waits (at most chansync::MOVE_DEFER_MAX_MS, 30 s) for what
+    // it would cut: a fragmented send, a bulk transfer, a sequence request, a sent
+    // command awaiting its ACK, raw packets arriving (OTA, a config pull).
     //
     // SEARCH (PROBE 26 / REPLY 27). A device that leads its group (nobody it hears
     // outranks it) and misses a board it knows - a floor peer (1..wcb_quantity), a
     // learned peer or the special peer, offline by the heartbeat sweep (50 s);
-    // temporary and rank-255 devices are never missed - visits every other channel
+    // devices ever seen advertising TEMPORARY or rank 255 are never missed (kept in
+    // NVS) - visits every other channel
     // its region allows: switch, broadcast a PROBE, listen 150 ms. Then it either
     // takes its group to a better leader it found (a MOVE at home) or visits each
     // worse group and sends it a MOVE home (3 frames, 100 ms apart, 600 ms). Not
     // before 40 s after boot, only once the condition has held 10 s, then attempts
-    // at 0, 1, 2, 4, 8, 16 and 32 minutes. A search waits until it can hop (no
-    // SoftAP stations connected, no STA association) and the device is quiet: no
-    // ensured send outstanding, no fragmented send, bulk transfer or sequence
-    // request in flight, no transmit-watchdog probe out, and no command or raw
-    // packet in or out for WCB_CHSYNC_QUIET_MS. While it is off its own channel
+    // at 0, 1, 2, 4, 8, 16 and 32 minutes - each the gap after the one before
+    // STARTED, so held-up attempts never run back to back - then none until a reboot,
+    // chanSyncSearchNow(), or the condition stays clear WCB_CHSYNC_TRIGGER_RESET_MS
+    // (10 min; a briefer clear carries on the same schedule). A search waits until
+    // it can hop (no SoftAP stations connected, no STA association) and the device
+    // is quiet: no ensured send outstanding, no fragmented send, bulk transfer or
+    // sequence request in flight, no transmit-watchdog probe out, and no command or
+    // raw packet in or out for WCB_CHSYNC_QUIET_MS. While it is off its own channel
     // (about 1.5-2 s) update() sends nothing else - no heartbeat, advert, retry or
     // watchdog probe - every send from the app returns false, and every received
     // frame except a REPLY is dropped. Every device with sync on answers a PROBE,
@@ -954,17 +973,20 @@ public:
 
     // Run one search now (when the device is quiet, within 30 s), if it can hop and
     // leads its group - a device it hears that outranks it is the one to search: the
-    // findings are weighed against the searcher. Logs why not. Restarts the attempt
-    // schedule. A rank-255 device (never leads) can search only while it hears nobody,
-    // which is how a stranded relay finds the mesh again.
+    // findings are weighed against the searcher. Not in the 40 s boot grace (the view
+    // of who leads is still settling). Logs why not. Restarts the attempt schedule.
+    // A rank-255 device (never leads) can search only while it hears nobody that takes
+    // part, which is how a stranded relay finds the mesh again.
     void    chanSyncSearchNow();
 
     // Operator move of the whole mesh to `channel`: a MOVE with the OPERATOR flag,
     // which every unpinned follower obeys whoever sent it; this device moves with it.
-    // Refused (false, and *why says why) when: not started, sync off, the channel is
-    // outside 1..maxChannel() or is the current one, a move or search is already
-    // running, a SoftAP is up and no onChannelMove() is registered (this device could
-    // not follow), or a PINNED device is heard - it would stay, the mesh would go, and
+    // Refused (false, and *why says why) when: not started, sync off, within
+    // WCB_CHSYNC_VIEW_SETTLE_MS of begin() (the neighbors' facts are still arriving),
+    // the channel is outside 1..maxChannel() or is the current one, a move or search
+    // is already running (or the host is still applying one), a SoftAP is up or the
+    // STA is associated and no onChannelMove() is registered (this device could not
+    // follow), or a PINNED device is heard - it would stay, the mesh would go, and
     // searching would bring everyone back.
     bool    chanSyncMove(uint8_t channel, String* why = nullptr);
 
@@ -1389,14 +1411,35 @@ private:
     CsFrame                _csRing[CS_RING];
     uint8_t                _csHead = 0, _csTail = 0;
 
-    // Off the home channel (a search visit or a pull): the RX task drops everything
-    // but a REPLY, and _espSend() refuses every frame but a channel-sync one.
+    // The radio is on another channel (a search visit or a pull): the RX task drops
+    // everything but a REPLY, and _espSend() refuses every frame but a channel-sync one.
+    // Set just before the radio leaves, cleared once it is back: a frame heard at home
+    // while a search is merely under way is still home's (a MOVE is held, below).
     volatile bool          _csOffHome    = false;
     volatile unsigned long _csBusyMs     = 0;       // last command / raw packet in or out (WCB_CHSYNC_QUIET_MS)
+    volatile unsigned long _csRawRxMs    = 0;       // last raw packet in (OTA, config pull): a live switch waits for it
+
+    // Never missed (CHANNEL_SYNC.md §4): ids that advertised TEMPORARY or rank 255. Sticky,
+    // and in NVS ("wcb_peers"/"csnever"), because the neighbor record that says so ages out
+    // exactly when the device is gone - and is not there at all after a reboot. RX task sets
+    // and clears bits (a reassigned id that advertises a real rank clears its bit); the
+    // loop task saves it when _csNeverMissDirty.
+    volatile uint32_t      _csNeverMiss      = 0;
+    volatile bool          _csNeverMissDirty = false;
+    bool                   _csBootSolicited  = false;   // the one WDP SOLICIT after begin() went out
 
     // A pending switch: a MOVE this device accepted, or announced itself.
     bool          _csMovePending = false;
     uint8_t       _csMoveCh      = 0;
+    unsigned long _csDeferSinceMs = 0;      // the switch waits for a session it would cut (0 = not waiting)
+    // The host took a move (onChannelMove returned true) and has not restarted yet: this
+    // device is leaving. No search, no new move, no operator move until it has.
+    uint8_t       _csHostMoveCh   = 0;
+    unsigned long _csHostMoveMs   = 0;
+    unsigned long _csHostWarnMs   = 0;
+    // A MOVE heard at home while a search was under way: judged once the search is over.
+    bool          _csHeldValid    = false;
+    CsFrame       _csHeld;
     unsigned long _csMoveAtMs    = 0;       // when to switch
     // MOVE frames this device is sending (an announce at home, or a pull abroad).
     uint8_t       _csAnnLeft     = 0;
@@ -1427,10 +1470,18 @@ private:
     uint8_t       _csPullMask[chansync::MAX_CHANNEL_CAP + 1] = {};
     bool          _csSearchNowReq = false;  // chanSyncSearchNow(): run one when quiet...
     unsigned long _csSearchNowMs  = 0;      // ...asked at this time; given up after MOVE_DEFER_MAX_MS of no quiet
-    // The attempt schedule (chansync::searchAttemptOffsetMs).
+    // The attempt schedule (chansync::searchAttemptOffsetMs), as the WCB firmware keeps it
+    // (WCB_ChanSync.cpp evaluateTrigger): attempt 0 TRIGGER_STABLE_MS after the condition
+    // began, each next one its offset GAP after the one before STARTED - so attempts held
+    // up (a station on the AP, a busy device) never run back to back once free - and a
+    // condition that clears and returns within WCB_CHSYNC_TRIGGER_RESET_MS carries on the
+    // schedule it had, so a member that flaps cannot restart seven attempts every cycle.
     unsigned long _csTrigSinceMs = 0;       // the search condition has held since (0 = not holding)
-    unsigned long _csTrigArmMs   = 0;       // ...and held TRIGGER_STABLE_MS: attempts count from here
+    bool          _csSched       = false;   // a schedule is under way
     uint8_t       _csAttempt     = 0;       // next attempt; SEARCH_ATTEMPTS = done until re-armed
+    unsigned long _csNextDueMs   = 0;       // when attempt _csAttempt may start
+    unsigned long _csClearedMs   = 0;       // the condition cleared at (with a schedule under way; 0 = holding)
+    bool          _csGaveUpSaid  = false;
     unsigned long _csLastEvalMs  = 0;
     uint32_t      _csSearches    = 0;
 
@@ -1448,6 +1499,13 @@ private:
     bool          _csCanHop(const char** why = nullptr) const;
     bool          _csQuiet(unsigned long now, const char** why = nullptr);
     bool          _csSoftApUp() const;
+    bool          _csIfaceUp(const char** why = nullptr) const;   // a SoftAP up or the STA associated
+    bool          _csMoveBusy(unsigned long now, const char** why = nullptr);   // a live switch would cut it
+    bool          _csViewSettled(unsigned long now) const;          // neighbors' CHAN facts have had time to land
+    void          _csResetTrigger();
+    void          _csEndSearch(unsigned long now);     // idle again; a MOVE held meanwhile is judged
+    void          _csSaveNeverMiss();
+    void          _csLoadNeverMiss();
     bool          _csSetRadio(uint8_t ch);             // esp_wifi_set_channel, logged on failure
     void          _csStartSearch(unsigned long now, bool manual, uint8_t missingId);
     void          _csSearchStep(unsigned long now);

@@ -39,13 +39,21 @@ and neighbour discovery, bulk transfer, and a raw-packet hook that OTA rides on.
    `tests/chansync_wire_test.cpp`. Never edit it here alone: change the WCB copy, run its test,
    copy it over (`git hash-object` of both must match). The library code around it is plumbing
    only; re-deriving an ordering or a verdict here splits the fleet.
-7. **Off its channel the library is a visitor.** A channel-sync search sets `_csOffHome`, and
-   while it is set `update()` returns after `_csTick()`, `_espSend()` refuses every frame but a
-   channel-sync one, and the receive path drops everything but a PROBE_REPLY. Anything new that
-   sends from `update()` sits below that early return; anything that sends from elsewhere goes
-   through `_espSend()`. A frame sent on a channel being visited introduces this device to a
-   group it is not part of. Channel-sync frames (types 25-27) also never refresh presence
-   (`_csHeardMs`): a visiting prober must not count as a member of the group it visits.
+7. **Off its channel the library is a visitor.** A channel-sync search sets `_csOffHome` just
+   before the radio leaves (not when the search starts: until then it is home, and a MOVE heard
+   is held for after the search), and while it is set `update()` returns after `_csTick()`,
+   `_espSend()` refuses every frame but a channel-sync one, and the receive path drops
+   everything but a PROBE_REPLY. Anything new that sends from `update()` sits below that early
+   return; anything that sends from elsewhere goes through `_espSend()`. A frame sent on a
+   channel being visited introduces this device to a group it is not part of. Channel-sync
+   frames (types 25-27) also never refresh presence (`_csHeardMs`): a visiting prober must not
+   count as a member of the group it visits.
+8. **The channel-sync plumbing mirrors the WCB firmware's `WCB_ChanSync.cpp`**, not just the
+   shared header: who counts as the best present (only keys with SYNC lead — `look()`), how a
+   neighbor's key is derived (`keyOf`), the attempt schedule (`evaluateTrigger`: re-based
+   attempts, a 10-minute reset), how a REPLY is credited (`onReply`), the held MOVE, the boot
+   SOLICIT. A client and a board that disagree on any of them split a mixed fleet. Change them
+   in step with the firmware.
 
 ## Verifying
 

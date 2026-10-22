@@ -680,37 +680,59 @@ wcb.setIdentity("MyDevice", "1.0");     // the key travels in the WDP advert
 - **Who leads.** Every device has a key: id, rank, pinned. A device that can lead beats one
   that cannot (rank 255); a **pinned** device — a WCB joined to a WiFi network, whose access
   point owns its channel — beats an unpinned one; then the lower rank; then the lower id. WCB
-  *n* has rank *n*, NaviCore 0, any other client 100 + id. A client is never pinned. The key is
-  advertised in WDP TLV `0x14` CHAN (`[channel][rank][flags][cc0][cc1]`) and decoded from every
-  neighbor into `WCBNeighbor::chan*`; a neighbor without it gets a derived key. **Call
-  `setIdentity()`**: a device that sends no advert is ranked by the WCBs as if it were a WCB.
+  *n* has rank *n*, NaviCore 0, any other client 100 + id. A client is never pinned. **Only a
+  device that takes part leads** (its key has SYNC): one with sync off, or firmware older than
+  channel sync, cannot move or search, so it is heard but never anyone's leader — the WCB
+  firmware's rule too. The key is advertised in WDP TLV `0x14` CHAN
+  (`[channel][rank][flags][cc0][cc1]`) and decoded from every neighbor into
+  `WCBNeighbor::chan*`; a neighbor without it gets a derived key (a WCB's number, a client's
+  100 + id, a temporary peer 255; SYNC off). One WDP SOLICIT goes out after the first boot advert
+  (or 1.5 s after `begin()` with no identity), so the neighbors' keys arrive in seconds rather
+  than at their next 60 s advert. **Call `setIdentity()`**: a device that sends no advert is
+  ranked by the WCBs as if it were a WCB, and never leads.
 - **MOVE** (ETM packet type 25). The leader broadcasts the new channel 5 times, 300 ms apart,
   and everyone switches 1.5 s after the first frame; each frame carries the time left. A
   follower acts on the first frame of a move and refuses it when sync is off, the channel is
-  outside its region, it is already there, or a device it hears outranks the sender.
+  outside its region, it is already there, or a device it hears outranks the sender. A MOVE
+  heard at home while this device's own search is under way is held and judged once the search
+  is over, with the time it has waited taken off its countdown.
 - **Switching.** At the switch time `onChannelMove(channel)` is called once, on the loop task.
-  Return `false` and the library calls `esp_wifi_set_channel()` — only possible with no SoftAP.
-  Return `true` and the library leaves the radio alone: a SoftAP moves only by restarting, so
-  save, then restart from your own `loop()`, never inside the callback. With a SoftAP up and no
-  callback (or `false`), the library says it cannot move, and stays. ESP-NOW peers are
+  Return `false` and the library calls `esp_wifi_set_channel()` — only possible with no SoftAP
+  and no STA association. Before it does, it waits (at most 30 s) for what a channel change would
+  cut: a fragmented send, a bulk transfer, a sequence request, a sent command awaiting its ACK,
+  raw packets still arriving (an OTA, a config pull). Return `true` and the library leaves the
+  radio alone: a SoftAP (or a STA association) moves only by restarting, so save, then restart
+  from your own `loop()`, never inside the callback. Until the restart the device counts as
+  **leaving**: it starts no search, follows and announces no other move, refuses an operator
+  move, and logs `*** ... has not restarted ... OFF THE MESH ***` every minute
+  (`WCB_CHSYNC_HOST_MOVE_MS`) if the restart never comes. A host that applies the move live
+  instead calls `setMeshChannel(channel)`, which ends it. With a SoftAP up or a STA association
+  and no callback (or `false`), the library says it cannot move, and stays. ESP-NOW peers are
   registered on channel 0 ("the current one"), so none needs registering again. After a live
   switch the device heartbeats and re-advertises at once, and the transmit watchdog waits
   `WCB_TXWD_HEARD_MS` before judging — a move is not a dead radio.
 - **Search** (PROBE 26 / REPLY 27). A device that leads its group and misses a board it knows
-  (a floor peer, a learned peer or the special peer, offline by the heartbeat sweep;
-  temporary and rank-255 devices are never missed) visits every other channel its region
-  allows: switch, broadcast a PROBE, listen 150 ms. Then it takes its group to a better leader
-  it found, or visits each worse group and sends it a MOVE home. Not before 40 s after boot,
-  only once the condition has held 10 s, then attempts at 0, 1, 2, 4, 8, 16 and 32 minutes.
-  It waits until the device can hop (no station on its SoftAP, no STA association) and is
-  quiet: no ensured send awaiting its ACK, no fragmented send, bulk transfer, sequence request
-  or watchdog probe in flight, and no command or raw packet in or out for 3 s
-  (`WCB_CHSYNC_QUIET_MS`; best-effort broadcasts such as telemetry do not count). While it is
-  away (about 1.5-2 s) `update()` sends nothing else — no heartbeat, advert, retry or probe —
-  every send the app makes returns `false` (an ensured one is retried once home), and every
-  frame received except a REPLY is dropped.
+  (a floor peer, a learned peer or the special peer, offline by the heartbeat sweep) visits
+  every other channel its region allows: switch, broadcast a PROBE, listen 150 ms. Then it takes
+  its group to a better leader it found, or visits each worse group and sends it a MOVE home.
+  A device ever seen advertising TEMPORARY or rank 255 is never missed — remembered in NVS
+  (`wcb_peers`/`csnever`), because the record that says so ages out exactly when the device has
+  gone, and is not there at all after a reboot. Not in the 40 s boot grace, only once the
+  condition has held 10 s, then attempts at 0, 1, 2, 4, 8, 16 and 32 minutes, each the gap after
+  the one before **started** (so attempts held up never run back to back); then none until a
+  reboot, `chanSyncSearchNow()`, or the condition stays clear for 10 minutes
+  (`WCB_CHSYNC_TRIGGER_RESET_MS`) — a shorter clear carries on the same schedule, so a member
+  that flaps cannot restart the seven attempts each time. It waits until the device can hop (no
+  station on its SoftAP, no STA association) and is quiet: no ensured send awaiting its ACK, no
+  fragmented send, bulk transfer, sequence request or watchdog probe in flight, and no command
+  or raw packet in or out for 3 s (`WCB_CHSYNC_QUIET_MS`; best-effort broadcasts such as
+  telemetry do not count). While the radio is away (about 1.5-2 s) `update()` sends nothing
+  else — no heartbeat, advert, retry or probe — every send the app makes returns `false` (an
+  ensured one is retried once home), and every frame received except a REPLY is dropped.
 - **Answering.** Every device with sync on answers a PROBE after `(id % 16) × 3 ms`, naming the
-  best device it hears, itself included.
+  best device it hears, itself included. A searcher credits both the best a REPLY names and the
+  responder itself — so a responder that still names the searcher (its offline sweep has not
+  run yet) still tells it who is there.
 - **Region.** `setRegion(cc)` before `begin()`: `"01"` or an IDF country code (`AT AU BE BG BR
   CA CH CN CY CZ DE DK EE ES FI FR GB GR HK HR HU IE IN IS IT JP KR LI LT LU LV MT MX NL NO NZ
   PL PT RO SE SI SK TW US`). `begin()` applies it with `esp_wifi_set_country_code(cc, false)`
@@ -723,7 +745,10 @@ wcb.setIdentity("MyDevice", "1.0");     // the key travels in the WDP advert
 - **Operator move.** `chanSyncMove(ch, &why)` sends a MOVE with the OPERATOR flag, which every
   unpinned follower obeys whoever sent it, and moves this device with it. It is refused when a
   pinned device is heard (it would stay, the mesh would go, and searching would bring everyone
-  back), when a SoftAP is up and no `onChannelMove()` is registered, and for a bad channel.
+  back), within 5 s of `begin()` (`WCB_CHSYNC_VIEW_SETTLE_MS`: a pinned device may not be known
+  yet), when a SoftAP is up or the STA is associated and no `onChannelMove()` is registered,
+  while a move or search runs, and for a bad channel. `chanSyncSearchNow()` is refused in the
+  boot grace and when another device leads the group.
 - **Status.** `printChanSyncStatus(Serial)` ends in
   `[CHSYNC:EN=1,CH=6,MAXCH=11,CC=01,RANK=105,PIN=0,LEAD=1,LRANK=1,LPIN=0,STATE=idle]`
   (`STATE` is `idle`, `search` or `move`).
@@ -936,7 +961,14 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
   group to a better leader or pulls the other group home. Every device advertises its key in
   WDP TLV `0x14` CHAN and decodes its neighbors' into `WCBNeighbor::chanValid`/`chanChannel`/
   `chanRank`/`chanFlags`/`chanCc`. The wire format and decisions are `src/WCB_ChanSyncWire.h`,
-  byte-identical to the WCB firmware's. Design: WCB repo `docs/CHANNEL_SYNC.md`. See *Channel
+  byte-identical to the WCB firmware's, and the plumbing around them follows the firmware's
+  (`WCB_ChanSync.cpp`): only a device with SYNC leads, one WDP SOLICIT after boot, attempts
+  re-based on when each really started and a schedule kept across a clear shorter than 10
+  minutes, a MOVE heard during a search judged after it, a REPLY credited to its responder too,
+  and a live switch that waits (≤ 30 s) for a session it would cut. A host that applies a move
+  itself leaves the device "leaving" until it restarts (`WCB_CHSYNC_HOST_MOVE_MS` warnings); a STA
+  association is treated like a SoftAP; devices seen as temporary or rank 255 are never missed by
+  a search (NVS `wcb_peers`/`csnever`). Design: WCB repo `docs/CHANNEL_SYNC.md`. See *Channel
   sync* above.
 - `setMeshChannel()` accepts 12-13 once `setRegion()` allows them (it was 1-11 only), and
   `begin()` falls back to `WCB_MESH_CHANNEL` with a warning for a channel the region does not
@@ -946,7 +978,12 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
   `RELAY_REGION`, prints `[WDPCH:...]` lines in `?WDP,DUMP`, and its WebSocket takes a login
   token (`?RELAY,WIFI,TOKEN,<token>|CLEAR`, `RELAY_WS_TOKEN`): `[AUTH:REQUIRED]` on open, no
   output and no command until `?AUTH,<token>`, `[AUTH:FAIL]` closes the session and locks every
-  `?AUTH` out for 1 s — the same protocol as a WCB's and NaviCore's WebSocket.
+  `?AUTH` out for 1 s — the same protocol as a WCB's and NaviCore's WebSocket. A session is its
+  serial, not its socket number: a queued command runs, and its session joins the console mirror,
+  only while that same session is open and logged in (lwIP reuses a closed socket's number for
+  the next connection). A session not logged in within 10 s is closed, and a full server evicts
+  a signed-out session before a signed-in one. A deferred restart is capped at 20 s however
+  busy the console is, so a client polling once a second cannot hold the relay on an old channel.
 - `WCB_CLIENT_VERSION_NUM` 11900.
 
 ### 1.18.1
