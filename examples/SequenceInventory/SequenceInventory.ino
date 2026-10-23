@@ -80,8 +80,9 @@ uint8_t gScanCursor = 1;
 
 // ── "mirror" state: fetch every sequence on one board, one at a time ─────────
 // This is the intended way to pull a whole board. There is deliberately no
-// "give me everything" packet: the total is unbounded and would silently exceed
-// what one reply can carry, whereas a single sequence never does.
+// "give me everything" packet: the total is unbounded, whereas a single sequence
+// is at most 3,999 characters (one longer than one reply comes in parts, and the
+// library delivers it whole).
 uint8_t gMirrorWCB   = 0;    // 0 = not mirroring
 int     gMirrorIndex = 0;    // which name we're on
 
@@ -144,7 +145,9 @@ void onSequenceValue(uint8_t wcbNumber, const char* key, WCBSeqStatus status, co
             Serial.printf("\n[SEQ] WCB%d  %s  — no such sequence\n", wcbNumber, key);
             break;
         case WCB_SEQ_TOOBIG:
-            Serial.printf("\n[SEQ] WCB%d  %s  — too large to send in one reply\n", wcbNumber, key);
+            // Only from a WCB whose firmware predates values in parts: a current one sends a long value
+            // in parts, which the library joins and delivers here as WCB_SEQ_OK.
+            Serial.printf("\n[SEQ] WCB%d  %s  — too long for that WCB's firmware to send (update it)\n", wcbNumber, key);
             break;
     }
 

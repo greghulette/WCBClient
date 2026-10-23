@@ -529,7 +529,8 @@ covers stored **values** as well as names, so an in-place edit moves it too.
 ```cpp
 wcb.onSequenceValue([](uint8_t n, const char* key, WCBSeqStatus st, const char* value) {
     if (st == WCB_SEQ_OK) { /* value = ";M1,1^;S5,<CA1021>" */ }
-    // else WCB_SEQ_NOTFOUND / WCB_SEQ_TOOBIG — always check before trusting value
+    // else WCB_SEQ_NOTFOUND / WCB_SEQ_TOOBIG (only from a WCB older than values in parts) —
+    // always check before trusting value
 });
 
 wcb.requestSequence(3, "wave");                          // one at a time
@@ -538,9 +539,9 @@ wcb.deleteSequence(3, "oldname");
 ```
 
 To mirror a whole board, pull the names and **walk them one at a time** — there is no
-"give me everything" call on purpose. A single value is bounded (~1800 chars, about 10 of
-the 16 chunks a reply can carry) but the total is not, so a bulk fetch would silently
-exceed it. Walking has no aggregate ceiling, lets you fetch lazily, and resumes cleanly if
+"give me everything" call on purpose. A single value is bounded (3,999 characters, the
+store's limit; one longer than one reply comes in parts and is delivered whole, see below) but
+the total is not, so a bulk fetch would have no ceiling. Walking has no aggregate ceiling, lets you fetch lazily, and resumes cleanly if
 a board drops. At ~100 ms per round trip a 20-sequence board mirrors in 2–3 seconds.
 
 Issuing the next request from *inside* a callback is fine — the library clears its
@@ -571,6 +572,17 @@ Notes:
   answers a list that long (its "Result too large" text is not taken for a list; 1.18.1 and
   earlier delivered it as an empty one), and a WCB with paged names does not answer a library
   older than 1.19.0 for one either, rather than send it something it would misread.
+- **A long value comes in parts, and the callback still fires once** (1.20.0). One reply
+  holds 2912 characters with the value's `<key>,OK,` head, and a WCB stores values of up to
+  3,999 (an ESP32-S3 can save one that long). `requestSequence()` asks for part 0 with the
+  59-byte SEQVAL_PART_REQ (packet type 31) ahead of the old SEQVAL_REQ, then for each further
+  part (type-34 replies), checks the joined reply against its CRC and calls
+  `onSequenceValue()` once with `WCB_SEQ_OK` and the whole value. A part is asked again after
+  3 s without it (3 times), the pull starts over if the value is edited mid-pull (twice), and a
+  pull that cannot finish is abandoned with a `[WCB_Client] sequence '<key>' ...` line and no
+  callback. A WCB whose firmware predates values in parts answers `WCB_SEQ_TOOBIG`, as before.
+  The split, the part header and the join are `src/WCB_ResultWire.h`, byte-identical to the
+  WCB firmware's (host-tested there by `tests/result_parts_test.cpp`).
 - `requestSequenceNames()` returns `false` unless a callback is registered first.
 - Names only, never contents. The values live in the board's config pull, which fits one
   reply only up to 2912 characters for the *entire* board config; past that it takes a
@@ -591,8 +603,8 @@ whatever `Print` the host passes to `begin()`. The host wires it in with four ca
 |---|---|---|
 | `?MGMT,PULL,<n>` | CONFIG_REQ (type 5) ×3 | `[MGMT:CONFIG,<n>]<config>`, or `[MGMT:CFGERR,<n>]<code>,<detail>` |
 | `?MGMT,PULL,<n>,P` | CONFIG_REQ_PARTS (type 19) ×3, then CONFIG_REQ (5) ×3 | as above, or one `[MGMT:CFGPART,<n>]P<id>,<k>,<K>:<data>~` line per part |
-| `?MGMT,STATS,<n>` | STATS_REQ (7) | `[MGMT:STATS,<n>]<text>` |
-| `?MGMT,ETM,CHAR,<n>` | ETM_REQ (8) | `[MGMT:ETM,<n>]<text>` |
+| `?MGMT,STATS,<n>` | RESULT_REQ (type 30) ×3, then STATS_REQ (7) | `[MGMT:STATS,<n>]<text>`, whole, however long |
+| `?MGMT,ETM,CHAR,<n>` | RESULT_REQ (30) ×3, then ETM_REQ (8) | `[MGMT:ETM,<n>]<text>`, whole, however long |
 | `?MGMT,FRAG,<n>,<sid>,<idx>,<total>,<payload>` | the chunk, forwarded | a `[relay] MGMT -> WCB<n> …` note |
 
 - **A config of up to 2912 characters is one `[MGMT:CONFIG,<n>]` line, exactly as before.**
@@ -605,8 +617,18 @@ whatever `Print` the host passes to `begin()`. The host wires it in with four ca
   silently, and every older Wizard stores any non-empty `[MGMT:CONFIG,<n>]` body as the
   board's config without checking it, so a part must never be able to look like one.
 - `[MGMT:CFGERR,<n>]` is a code and a short ASCII detail, never config text: `NOPARTS` (over
-  the limit, and the request did not ask for parts), `TOOBIG` (would need more than 16
-  parts), and `NOMEM` and `CHANGED`, which are worth retrying.
+  the limit, and the request did not ask for parts), `TOOBIG` (would need more than 64
+  parts, more than any board's config), and `NOMEM` and `CHANGED`, which are worth retrying.
+- **A STATS or ETM result too long for one reply comes in parts** (1.20.0; a full fleet's
+  `?STATS` is up to ~6.6 KB). `WcbMgmt::ResultPuller` asks for part 0 with RESULT_REQ (type 30,
+  59 B) three times and the old request behind it, then for each further part; the WCB holds
+  the result it built and sends a part per request as type 32 / 33, split after a line. Each
+  part is printed as it comes, in one write - part 0 behind its tag, the last with the line
+  end - so what the relay prints is byte for byte the one reply an older WCB sends, and nothing
+  is held. A lost part is asked again (3 times, 3 s apart); a pull that cannot finish prints
+  `[MGMT] Stats from WCB<n>: ...` (or `ETM characterization results`) saying why. An older WCB
+  answers the old request as it always did: whole, or the `[ERROR] Result too large to relay`
+  text. `examples/MgmtRelay` runs the same `ResultPuller`.
 - **One reassembly slot.** A reply is keyed on (session id, packet type, source board), and a
   part never displaces a CONFIG/STATS/ETM reply that is still arriving (a frame within the
   last 200 ms): the part is dropped and recovered by the target's second pass or a retry.
@@ -961,6 +983,20 @@ wcb.setChecksum(false);   // Only if ?ETM,CHKSM,OFF on all WCBs
 ---
 
 ## Changelog
+
+### 1.20.0
+
+- **Mesh results in parts** (`src/WCB_ResultWire.h`, byte-identical to the WCB firmware's,
+  host-tested there by `tests/result_parts_test.cpp`; design: WCB repo `docs/MGMT_RELAY.md` §10).
+  `requestSequence()` reads a value too long for one 2912-character reply a part at a time
+  (SEQVAL_PART_REQ 31 / SEQVAL_PART 34) and fires `onSequenceValue()` once with the whole value;
+  `WCB_SEQ_TOOBIG` now comes only from a WCB that predates it. `WcbMgmt` (and
+  `examples/MgmtRelay`, through the new `WcbMgmt::ResultPuller`) relays `?MGMT,STATS` and
+  `?MGMT,ETM,CHAR` results too long for one reply whole, a part per request (RESULT_REQ 30,
+  STATS_PART 32, ETM_PART 33), printed as they come - where it printed the WCB's `[ERROR] Result
+  too large to relay` text. A STATS / ETM part frag yields the reassembly slot to a live
+  CONFIG / STATS / ETM reply, as a config part does. `examples/MgmtRelay` is relay 1.4.
+- `WCB_CLIENT_VERSION_NUM` 12000.
 
 ### 1.19.0
 

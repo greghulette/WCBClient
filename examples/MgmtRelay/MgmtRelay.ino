@@ -138,6 +138,7 @@
 */
 
 #include <WCB_Client.h>
+#include <WCB_Mgmt.h>         // WcbMgmt::ResultPuller: ?MGMT,STATS / ETM,CHAR results in parts (1.20.0)
 #include <mbedtls/base64.h>   // Phase 3: decode the Wizard's base64 OTA_DATA fragments
 #include <Preferences.h>      // the channel the mesh last moved this relay to, and the WiFi settings
 
@@ -156,7 +157,7 @@ const uint8_t DEVICE_ID    = 19;
 const uint8_t NAVICORE_ID  = WCB_SPECIAL_ID;   // = 20
 
 // This relay's firmware string, advertised over WDP so it shows up by name.
-const char*   RELAY_FW     = "1.3";   // 1.3: channel sync (follows the mesh), WebSocket login token
+const char*   RELAY_FW     = "1.4";   // 1.4: STATS / ETM,CHAR results in parts; 1.3: channel sync, WebSocket login token
 
 // Name this relay advertises (WDP) and reports to the WCB Wizard as its alias.
 const char*   RELAY_ALIAS  = "Mgmt Relay";
@@ -329,6 +330,14 @@ class HostOut : public Print {
 HostOut host;
 
 WCB_Client wcb(MAC_OCT2, MAC_OCT3, PASSWORD, WCB_QUANTITY, DEVICE_ID);
+
+// A ?MGMT,STATS / ETM,CHAR result too long for one reply (a full fleet's ?STATS) comes in parts and is
+// printed as it comes, as the one reply an older WCB sends (WCB_ResultWire.h). The same puller WcbMgmt
+// runs: the wire protocol lives in the library, not in a copy here.
+WcbMgmt::ResultPuller resultPuller;
+static bool relaySendRaw(uint8_t target, const uint8_t* data, size_t len) {
+  return wcb.sendRawPacket(target, data, len);
+}
 
 // ── Deferred reboot ────────────────────────────────────────────────────────────
 // NEVER ESP.restart() FROM A COMMAND HANDLER. A host tool sends commands as a
@@ -1061,8 +1070,10 @@ void processConfigFrag(const uint8_t* data) {
   if (pkt.requesterWCB != DEVICE_ID) return;
   if (pkt.totalChunks == 0 || pkt.totalChunks > MGMT_CHUNKS) return;
   if (pkt.chunkIdx >= MGMT_CHUNKS || pkt.chunkIdx >= pkt.totalChunks) return;
+  const bool result = pkt.packetType == WcbMgmt::PT_STATS_PART || pkt.packetType == WcbMgmt::PT_ETM_PART;
   if (pkt.packetType != PT_CONFIG_FRAG && pkt.packetType != PT_STATS_FRAG &&
-      pkt.packetType != PT_ETM_FRAG    && pkt.packetType != PT_CONFIG_PART) return;
+      pkt.packetType != PT_ETM_FRAG    && pkt.packetType != PT_CONFIG_PART && !result) return;
+  if (result && !resultPuller.takes(pkt.packetType, pkt.sourceWCB)) return;   // a part this relay did not ask for
   // The 2nd pass. One value covers every reply type: a target that sends parts never gives two
   // consecutive sessions (each part, each error) the same id.
   if (lastDeliveredSession != 0 && pkt.sessionId == lastDeliveredSession) return;
@@ -1077,8 +1088,11 @@ void processConfigFrag(const uint8_t* data) {
     // timers would meet the stream again on every attempt. So a part frag yields to a live
     // non-part session and is dropped; the part's second pass or the new Wizard's retry recovers
     // it. A non-part frag always takes the slot, exactly as before parts existed.
-    if (pkt.packetType == PT_CONFIG_PART && fragReasm.active &&
-        fragReasm.packetType != PT_CONFIG_PART &&
+    // A STATS / ETM part yields the same way.
+    const auto isPart = [](uint8_t t) {
+      return t == PT_CONFIG_PART || t == WcbMgmt::PT_STATS_PART || t == WcbMgmt::PT_ETM_PART;
+    };
+    if (isPart(pkt.packetType) && fragReasm.active && !isPart(fragReasm.packetType) &&
         (millis() - fragReasm.lastMs) < PART_YIELD_MS) return;
     memset(&fragReasm, 0, sizeof(fragReasm));
     fragReasm.active     = true;
@@ -1093,6 +1107,8 @@ void processConfigFrag(const uint8_t* data) {
     fragReasm.receivedMask |= (1 << pkt.chunkIdx);
   }
   fragReasm.lastMs = millis();
+  if (result) resultPuller.heard(pkt.packetType, pkt.sourceWCB, pkt.chunkIdx, fragReasm.chunks[pkt.chunkIdx],
+                                 strlen(fragReasm.chunks[pkt.chunkIdx]));
 
   uint16_t expected = (uint16_t)((1 << pkt.totalChunks) - 1);
   if (fragReasm.receivedMask != expected) return;
@@ -1111,6 +1127,14 @@ void processConfigFrag(const uint8_t* data) {
   }
   body[len] = '\0';
 
+  if (result) {   // printed in one write as the next piece of the one reply, the next part asked
+    lastDeliveredSession = fragReasm.sessionId;
+    const uint8_t type = fragReasm.packetType, src = fragReasm.sourceWCB;
+    resultPuller.part(type, src, body, len, sizeof(fragReasm.chunks));
+    memset(&fragReasm, 0, sizeof(fragReasm));
+    return;
+  }
+
   const char* tag  = nullptr;
   const char* text = body;
   if      (fragReasm.packetType == PT_CONFIG_FRAG) tag = "CONFIG";
@@ -1126,6 +1150,7 @@ void processConfigFrag(const uint8_t* data) {
   // anything after its '~'). If printf cannot allocate that buffer it prints nothing, and a missing
   // line is a retry, never a wrong config.
   if (tag) host.printf("[MGMT:%s,%d]%s\n", tag, (int)fragReasm.sourceWCB, text);
+  resultPuller.whole(fragReasm.packetType, fragReasm.sourceWCB);   // a STATS / ETM pull of that board is answered
   memset(&fragReasm, 0, sizeof(fragReasm));
 }
 
@@ -1471,13 +1496,18 @@ void relaySerialLine(char* line) {
             //               [MGMT:CFGPART,<n>] lines, one per part
             //   STATS     → request ESP-NOW stats            (reply: [MGMT:STATS,<n>])
             //   ETM,CHAR  → request ETM characterization     (reply: [MGMT:ETM,<n>])
+            //   (a result too long for one reply comes in parts and prints as that one reply)
             // Remote-terminal START/STOP/keystrokes ride inside a FRAG; its OUTPUT comes back
             // as [TERM:<n>] via processRemoteTerm.
             char* m = line + 6;                  // skip "?MGMT,"
             if      (iStarts(m, "FRAG,"))     handleMgmtFrag(m + 5);
             else if (iStarts(m, "PULL,"))     sendPull(m + 5);
-            else if (iStarts(m, "STATS,"))    sendConfigReq((uint8_t)atoi(m + 6), PT_STATS_REQ, 1);
-            else if (iStarts(m, "ETM,CHAR,")) sendConfigReq((uint8_t)atoi(m + 9), PT_ETM_REQ,   1);
+            else if (iStarts(m, "STATS,") || iStarts(m, "ETM,CHAR,")) {
+              const bool etm = iStarts(m, "ETM,CHAR,");
+              const int  t   = atoi(m + (etm ? 9 : 6));
+              if (t >= 1 && t <= WCB_MAX_BOARDS)
+                resultPuller.start(etm ? rparts::KIND_ETM : rparts::KIND_STATS, (uint8_t)t);
+            }
             return;
         }
         if (iStarts(c, "OTA,")) { relayOtaCommand(c + 4); return; }   // Phase 3: wireless OTA relay
@@ -1603,6 +1633,7 @@ void setup() {
         host.println("[relay] begin() FAILED (see error above) — halting.");
         while (true) delay(1000);
     }
+    resultPuller.begin(&relaySendRaw, &host, PASSWORD, DEVICE_ID);
 
     // Reach the NaviCore (special peer) so ;w20,... works, and advertise this
     // relay over WDP so boards discover and auto-join it (and can reply to it).
@@ -1685,6 +1716,7 @@ void loop() {
     }
     // Drop a stalled reassembly (lost fragment) after 6 s so a later pull isn't wedged.
     if (fragReasm.active && (millis() - fragReasm.lastMs) > 6000) fragReasm.active = false;
+    resultPuller.service(millis());          // a STATS / ETM part lost: ask again; one that cannot finish: say so
 
     // Read USB serial one line at a time (CR/LF terminated) and relay it.
     while (Serial.available()) {

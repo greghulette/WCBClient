@@ -6,6 +6,7 @@
 #include <atomic>
 #include "WCB_ChanSyncWire.h"   // channel sync wire format + decisions; byte-identical to the WCB firmware's copy
 #include "WCB_SeqNamesWire.h"   // the sequence-names reply's pages: split, header, reassembly; byte-identical too
+#include "WCB_ResultWire.h"     // a result too long for one reply, in parts (one sequence's value); byte-identical too
 
 // Forward declaration — WCBStream is defined in WCBStream.h.
 // Keeps this header self-contained; users include WCBStream.h only when needed.
@@ -128,7 +129,7 @@ constexpr uint8_t broadcast = 0;
 
 // The library's version as a number - major*10000 + minor*100 + patch - kept equal to library.properties, so a
 // consumer can refuse to build against one too old: #if WCB_CLIENT_VERSION_NUM < 11900 ... #error ... #endif
-#define WCB_CLIENT_VERSION_NUM 11900
+#define WCB_CLIENT_VERSION_NUM 12000
 
 // ── Channel sync (1.19.0) ────────────────────────────────────────────────────
 // Design: WCB repo docs/CHANNEL_SYNC.md. Wire format and every decision: WCB_ChanSyncWire.h
@@ -255,6 +256,11 @@ typedef struct __attribute__((packed)) {
 // sent behind it.
 #define WCB_PACKET_SEQ_PAGE_REQ 28 // firmware PACKET_TYPE_SEQ_PAGE_REQ (this → target)
 #define WCB_PACKET_SEQ_PAGE    29  // firmware PACKET_TYPE_SEQ_PAGE     (target → this)
+// One sequence's value longer than one reply comes a part per request (1.20.0, WCB_ResultWire.h): the part
+// request rides the 59-byte struct with the key, the part comes back as type 34. A WCB that predates it drops
+// the 31 and answers the type-15 copies sent behind it (TOOBIG for a value that long).
+#define WCB_PACKET_SEQVAL_PART_REQ 31 // firmware PACKET_TYPE_SEQVAL_PART_REQ (this → target)
+#define WCB_PACKET_SEQVAL_PART     34 // firmware PACKET_TYPE_SEQVAL_PART     (target → this)
 #define WCB_SEQ_PAYLOAD_SIZE  183  // firmware CONFIG_PAYLOAD_SIZE
 #define WCB_SEQ_MAX_CHUNKS    16   // firmware MGMT_MAX_CHUNKS (uint16 mask)
 #define WCB_SEQ_KEY_MAX       15   // NVS key limit — a longer key cannot be stored at all
@@ -277,6 +283,17 @@ typedef struct __attribute__((packed)) {
     uint8_t requesterWCB;
     char    key[16];               // NUL-terminated, ≤15 chars
 } wcb_packet_seqval_req_t;
+
+// One part of one sequence's value (59 B, 1.20.0): the key without its NUL - a 15-character key
+// fills the field. Part 0 is the first request; the WCB reads the value again for every part.
+typedef struct __attribute__((packed)) {
+    char    structPassword[40];
+    uint8_t packetType;            // WCB_PACKET_SEQVAL_PART_REQ
+    uint8_t targetWCB;
+    uint8_t requesterWCB;
+    uint8_t part;                  // 0-based
+    char    key[15];               // NUL-padded
+} wcb_packet_seqvalpart_req_t;
 
 // One page of the names (59 B, the size of the request above on purpose: the 43-byte request
 // has no spare byte, and a WCB takes 59-byte requests on the queue its names handler reads).
@@ -561,7 +578,8 @@ typedef void (*WCBSequenceNamesCallback)(uint8_t wcbNumber, uint32_t hash,
 enum WCBSeqStatus : uint8_t {
     WCB_SEQ_OK       = 0,   // `value` holds the sequence
     WCB_SEQ_NOTFOUND = 1,   // no such key on that board (`value` empty)
-    WCB_SEQ_TOOBIG   = 2,   // stored value exceeds what one reply can carry (`value` empty)
+    WCB_SEQ_TOOBIG   = 2,   // the value does not fit one reply and the WCB predates values in parts;
+                            // a current WCB sends it in parts instead (`value` empty)
 };
 
 // Called when a board answers requestSequence() with ONE sequence's contents.
@@ -1104,13 +1122,22 @@ public:
 
     // Fetch ONE sequence's full contents from `wcbNumber` by key.
     //
-    // Deliberately one at a time. A single value is bounded (~1800 chars, about 10
-    // of the 16 available chunks) but the whole set is not — pull the name list with
-    // requestSequenceNames() and walk it, which has no aggregate ceiling, fetches
-    // lazily, and resumes cleanly if a board drops mid-walk.
+    // Deliberately one at a time. A single value is bounded (3999 characters, the store's
+    // limit) but the whole set is not — pull the name list with requestSequenceNames() and
+    // walk it, which has no aggregate ceiling, fetches lazily, and resumes cleanly if a board
+    // drops mid-walk.
+    //
+    // A value too long for one mesh reply (2912 characters with its "<key>,OK," head) comes
+    // in parts (1.20.0, WCB_ResultWire.h): the first request asks for part 0 in a form only a
+    // WCB with values in parts answers, and the old form behind it; the library then asks for
+    // each further part itself (each up to 3 times, 3 s apart), starts over if the value is
+    // edited mid-pull (at most twice), checks the whole against its CRC, and fires the
+    // callback once with the whole value. A WCB that predates it answers TOOBIG, as before.
+    // A pull that cannot finish is abandoned with a "[WCB_Client] sequence ..." line on Serial
+    // and no callback.
     //
     // Shares the single in-flight slot with requestSequenceNames(): returns false if
-    // either is already pending. Same ~4 s silent abandon.
+    // either is already pending. Same ~4 s silent abandon when no answer comes at all.
     //
     // Returns false if: not started, `wcbNumber` out of range, key empty or longer
     // than WCB_SEQ_KEY_MAX, a request is already pending, no callback registered, or
@@ -1876,6 +1903,12 @@ private:
     void _seqSendNames(unsigned page, bool withOld);
     void _seqRearm(uint16_t doneSession);
     void _seqNamesPage(const String& full, unsigned long now);
+    // One value in parts (1.20.0, WCB_ResultWire.h): _seqNames holds the joined reply, "<key>,OK,<value>",
+    // sized at part 0. _seqValPaging: a part frag was heard - the WCB pages, so a lost part is asked again.
+    rparts::Assembly       _seqValAsm;
+    volatile bool          _seqValPaging   = false;
+    void _seqSendValue(unsigned part, bool withOld);
+    void _seqValuePart(const String& full);
     // The RX task writes into _seqChunks while the LOOP task frees it on delivery
     // or timeout — a use-after-free window without this. Same pattern as _bulkMux:
     // the guarded regions are tiny (a bounds check + one 183-byte memcpy on RX, a

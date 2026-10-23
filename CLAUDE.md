@@ -41,7 +41,10 @@ and neighbour discovery, bulk transfer, and a raw-packet hook that OTA rides on.
    only; re-deriving an ordering or a verdict here splits the fleet. **`src/WCB_SeqNamesWire.h`
    is the same kind of copy** of `Code/WCB/WCB_SeqNamesWire.h`: where a stored-sequence names
    list too long for one reply is split into pages, the page header, and the join, host-tested
-   there by `tests/seqnames_page_test.cpp`. Same rule.
+   there by `tests/seqnames_page_test.cpp`. Same rule. **So is `src/WCB_ResultWire.h`**
+   (`Code/WCB/WCB_ResultWire.h`): a `?MGMT,STATS` / `ETM,CHAR` result or one sequence's value
+   too long for one reply, in parts - the split, the part header, the join and the requester's
+   clock (`rparts::Clock`), host-tested by `tests/result_parts_test.cpp`.
 7. **Off its channel the library is a visitor.** A channel-sync search sets `_csOffHome` just
    before the radio leaves (not when the search starts: until then it is home, and a MOVE heard
    is held for after the search), and while it is set `update()` returns after `_csTick()`,
@@ -71,6 +74,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32s3 --library . --build-path .build/a
 # The channel-sync and sequence-names headers must be the WCB firmware's files, byte for byte (rule 6):
 git hash-object src/WCB_ChanSyncWire.h   # == the WCB repo's Code/WCB/WCB_ChanSyncWire.h
 git hash-object src/WCB_SeqNamesWire.h   # == the WCB repo's Code/WCB/WCB_SeqNamesWire.h
+git hash-object src/WCB_ResultWire.h     # == the WCB repo's Code/WCB/WCB_ResultWire.h
 ```
 
 Real verification is on hardware, with at least one actual WCB present — mesh behaviour
@@ -84,6 +88,7 @@ change has only been compiled.
 | `src/WCB_Client.{h,cpp}` | the library — join, send, receive, WDP, heartbeats, bulk, channel sync (the `_cs*` section at the end of the .cpp) |
 | `src/WCB_ChanSyncWire.h` | channel sync wire format + decisions — the WCB firmware's file, byte-identical (rule 6) |
 | `src/WCB_SeqNamesWire.h` | the sequence-names reply in pages: split, page header, join — the WCB firmware's file, byte-identical (rule 6) |
+| `src/WCB_ResultWire.h` | a STATS / ETM result or one sequence's value in parts: split, part header, join, the requester's clock — the WCB firmware's file, byte-identical (rule 6) |
 | `src/WCBStream.{h,cpp}` | `Stream` adapter that forwards raw bytes (Maestro packets) over the mesh |
 | `src/WCB_Mgmt.h` | `WcbMgmt`: makes a host the Wizard's management relay (NaviCore) |
 | `examples/` | one per capability — `AllFeatures` is the broadest; `MgmtRelay` is a product in its own right (WebSocket with a login token, channel persistence) |
@@ -105,9 +110,9 @@ consumers can do flash I/O (and, for the last two, decide on a restart) inside t
 so in the header; state the calling context explicitly on anything new, either way.
 
 **Sequence reads are one at a time, on purpose.** `requestSequenceNames()` returns names
-only; `requestSequence()` returns ONE value by key. There is deliberately no "fetch every
-sequence" call — a single value is bounded (~1800 chars ≈ 10 of 16 chunks) but the total is
-not, and the WCB config pull already demonstrates the failure mode: it carries values,
+only; `requestSequence()` returns ONE value by key (in parts past one reply, joined, one
+callback: 1.20.0, `WCB_ResultWire.h`). There is deliberately no "fetch every sequence" call —
+a single value is bounded (3,999 characters) but the total is not, and the WCB config pull already demonstrates the failure mode: it carries values,
 exceeds 2912 chars on a real board, and past that arrives only in parts, which took a new
 packet type, a whole-config CRC and a new Wizard to make safe (`?MGMT,PULL,<n>,P`,
 `src/WCB_Mgmt.h`). Adding a bulk fetch walks straight back into that. Consumers walk the name

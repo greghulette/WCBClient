@@ -81,9 +81,36 @@ static const uint8_t PT_CONFIG_PART      = 18;  // target → requester, 230 B
 static const uint8_t PT_CONFIG_REQ_PARTS = 19;  // requester → target, 43 B: "I take parts"
 // In the 204-byte struct. SIZE disambiguates it from PT_STATS_REQ (43 B).
 static const uint8_t PT_REMOTE_TERM = 7;
+// A ?MGMT,STATS or ?MGMT,ETM,CHAR result too long for one reply (a full fleet's ?STATS is up
+// to ~6.6 KB, 19 peers' ETM characterization ~5.2 KB) comes in parts (1.20.0,
+// WCB_ResultWire.h): asked with PT_RESULT_REQ (59 B) three times and the old request behind
+// it, a part per request back as PT_STATS_PART / PT_ETM_PART, each printed as it comes - so
+// what this relay prints is byte for byte the one reply an older WCB sends (ResultPuller).
+static const uint8_t PT_RESULT_REQ = rparts::PT_RESULT_REQ;   // 30, requester → target
+static const uint8_t PT_STATS_PART = rparts::PT_STATS_PART;   // 32, target → requester
+static const uint8_t PT_ETM_PART   = rparts::PT_ETM_PART;     // 33
+static_assert(PT_STATS_REQ == rparts::PT_STATS_REQ && PT_ETM_REQ == rparts::PT_ETM_REQ &&
+              PT_STATS_FRAG == rparts::PT_STATS_FRAG && PT_ETM_FRAG == rparts::PT_ETM_FRAG,
+              "WCB_ResultWire.h packet types != WCB_Mgmt.h's");
 
 static const size_t  CFG_PAYLOAD  = 183;   // firmware CONFIG_PAYLOAD_SIZE
 static const uint8_t MGMT_CHUNKS  = 16;    // firmware MGMT_MAX_CHUNKS (uint16 receivedMask)
+
+// 59 B — requester → target: start a STATS / ETM result in parts (id 0), or ask part `part`
+// of the one held under `id` (from its part 0).
+typedef struct __attribute__((packed)) {
+  char     structPassword[40];
+  uint8_t  packetType;     // PT_RESULT_REQ
+  uint8_t  targetWCB;
+  uint8_t  requesterWCB;
+  uint8_t  kind;           // rparts::KIND_STATS / KIND_ETM
+  uint8_t  part;           // 0-based
+  uint16_t id;             // 0 = start
+  uint8_t  reserved[12];
+} result_req;
+static_assert(sizeof(result_req) == rparts::REQ_LEN && offsetof(result_req, kind) == rparts::REQ_KIND_AT &&
+              offsetof(result_req, part) == rparts::REQ_PART_AT && offsetof(result_req, id) == rparts::REQ_ID_AT,
+              "result_req must match the firmware's espnow_struct_result_req (59 B)");
 
 // 43 B — requester → target (config / stats / etm; only packetType differs).
 typedef struct __attribute__((packed)) {
@@ -114,6 +141,213 @@ typedef struct __attribute__((packed)) {
   uint8_t textLen;
   char    text[160];
 } remote_term;
+
+// ── A STATS / ETM result pulled in parts ────────────────────────────────────
+// Host-agnostic: the host says how to send a raw frame to a board and where to print, and
+// feeds it the 230-byte replies it reassembles. WcbMgmt runs one; so does examples/MgmtRelay.
+// Everything runs on the host's loop task (service()), so each part goes out in one write and
+// nothing else this host prints from that task can land inside a line.
+class ResultPuller {
+ public:
+  typedef bool (*SendFn)(uint8_t target, const uint8_t* data, size_t len);
+
+  void begin(SendFn send, Print* out, const char* password, uint8_t me) {
+    send_ = send;
+    out_  = out;
+    pw_   = password ? password : "";
+    me_   = me;
+  }
+
+  // ?MGMT,STATS,<n> (kind STATS) / ?MGMT,ETM,CHAR,<n> (kind ETM): the parts request x3, 15 ms
+  // apart, then the old request once, as every relay before parts sent it. A pull of the same
+  // kind still running is replaced.
+  void start(uint8_t kind, uint8_t target) {
+    const int k = idx(kind);
+    if (p_[k].clock.active() && p_[k].printed)
+      say(k, "stopped after part %u of %u for a new request.", p_[k].as.next, p_[k].as.first.parts);
+    end(k);
+    p_[k].clock.begin(kind, target, millis());
+    ask(k, 0, true);
+  }
+
+  // Does this host take a 230-byte reply of `type` from `src`? A whole one always (it prints it
+  // as it always did); a part only while its pull from that board runs.
+  bool takes(uint8_t type, uint8_t src) const {
+    bool part = false;
+    const uint8_t kind = rparts::kindOfType(type, part);
+    if (kind != rparts::KIND_STATS && kind != rparts::KIND_ETM) return false;
+    if (!part) return true;
+    const Pull& p = p_[idx(kind)];
+    return p.clock.active() && p.clock.target == src;
+  }
+
+  // Every frag of a part, as it is taken: the board pages, so a part lost from both passes is
+  // asked again - part 0 by the id its first frag carries (the result is held under it; with
+  // id 0 the board would build, or run, a new one).
+  void heard(uint8_t type, uint8_t src, uint8_t chunkIdx, const char* payload, size_t n) {
+    bool part = false;
+    const uint8_t kind = rparts::kindOfType(type, part);
+    if (!part || (kind != rparts::KIND_STATS && kind != rparts::KIND_ETM)) return;
+    Pull& p = p_[idx(kind)];
+    if (!p.clock.active() || p.clock.target != src) return;
+    p.clock.heard(millis());
+    rparts::Header h;
+    size_t at = 0;
+    if (chunkIdx == 0 && !p.clock.paging && rparts::parseHeader(payload, n, h, at) && h.part == 0) {
+      p.askId = h.id;
+      p.clock.startPaging(millis());
+    }
+  }
+
+  // A whole reply (type 9 / 10) from `src` was printed: a pull of its kind from there is answered.
+  void whole(uint8_t type, uint8_t src) {
+    bool part = false;
+    const uint8_t kind = rparts::kindOfType(type, part);
+    if (part || (kind != rparts::KIND_STATS && kind != rparts::KIND_ETM)) return;
+    const int k = idx(kind);
+    if (p_[k].clock.active() && p_[k].clock.target == src) end(k);
+  }
+
+  // A part, reassembled and compacted into `body` (len bytes; cap >= len + 1): check it, print it
+  // in ONE write - part 0 behind its tag, the last with the line end - and ask the next.
+  void part(uint8_t type, uint8_t src, char* body, size_t len, size_t cap) {
+    bool isPart = false;
+    const uint8_t kind = rparts::kindOfType(type, isPart);
+    if (!isPart || (kind != rparts::KIND_STATS && kind != rparts::KIND_ETM)) return;
+    const int k = idx(kind);
+    Pull& p = p_[k];
+    if (!p.clock.active() || p.clock.target != src) return;
+    rparts::Header h;
+    size_t at = 0;
+    if (!rparts::parseHeader(body, len, h, at)) return;
+    const rparts::Step chk = p.as.check(h);
+    if (chk == rparts::STEP_STALE || chk == rparts::STEP_BAD) return;
+    if (chk == rparts::STEP_RESTART) {   // a held result is never rebuilt: another one replaced it
+      say(k, "the result changed after part %u of %u was printed - the rest is not printed. Ask again.",
+          p.as.next, p.as.first.parts);
+      end(k);
+      return;
+    }
+    if (h.part == 0) {
+      p.as.start(h);
+      p.askId = h.id;
+      p.clock.startPaging(millis());
+    }
+    const rparts::Step st = p.as.take(body + at, len - at);
+    if (st == rparts::STEP_BAD) return;   // asked again on the retry timer
+    if (st == rparts::STEP_RESTART) {
+      say(k, "part %u of %u does not match the result's checksum - the rest is not printed. Ask again.",
+          h.part + 1, h.parts);
+      end(k);
+      return;
+    }
+    // The tag goes into the tail of the header, in front of the data (a header is at least 20
+    // characters, "[MGMT:STATS,255]" 16), the line end after it.
+    size_t from = at, to = len;
+    if (h.part == 0) {
+      char tag[24];
+      const int tn = snprintf(tag, sizeof(tag), "[MGMT:%s,%d]", k ? "ETM" : "STATS", (int)src);
+      if (tn > 0 && (size_t)tn <= at) {
+        from = at - (size_t)tn;
+        memcpy(body + from, tag, (size_t)tn);
+      }
+    }
+    if (st == rparts::STEP_DONE && to < cap) body[to++] = '\n';
+    out_->write((const uint8_t*)body + from, to - from);
+    p.printed = true;
+    if (st == rparts::STEP_DONE) {
+      end(k);
+      return;
+    }
+    p.clock.asked(millis());
+    ask(k, p.as.next, false);
+  }
+
+  // From loop(): ask a lost part again; end a pull nobody answered (silently, as the one-reply
+  // request always did), or one that cannot finish (with a line saying why).
+  void service(uint32_t now) {
+    for (int k = 0; k < 2; k++) {
+      Pull& p = p_[k];
+      switch (p.clock.tick(now)) {
+        case rparts::Clock::T_SILENT:  end(k); break;
+        case rparts::Clock::T_NEVER:
+          say(k, "part %u of %u never came (asked %u times) - the rest is not printed. Ask again.",
+              p.as.next + 1, p.as.first.parts, (unsigned)p.clock.tries);
+          end(k);
+          break;
+        case rparts::Clock::T_TIMEOUT:
+          say(k, "did not finish in %u s - the rest is not printed. Ask again.",
+              (unsigned)(rparts::PULL_MAX_MS / 1000));
+          end(k);
+          break;
+        case rparts::Clock::T_ASK:
+          p.clock.again(now);
+          ask(k, p.as.next, false);
+          break;
+        default: break;
+      }
+    }
+  }
+
+ private:
+  struct Pull {
+    rparts::Clock    clock;
+    rparts::Assembly as;
+    uint16_t         askId   = 0;      // the held result's id (0 = start one)
+    bool             printed = false;  // part 0 is out
+  };
+  Pull        p_[2];                   // [0] STATS, [1] ETM
+  SendFn      send_ = nullptr;
+  Print*      out_  = nullptr;
+  const char* pw_   = "";
+  uint8_t     me_   = 0;
+
+  static int idx(uint8_t kind) { return kind == rparts::KIND_ETM ? 1 : 0; }
+
+  void end(int k) {
+    p_[k].clock.stop();
+    p_[k].as.reset();
+    p_[k].askId   = 0;
+    p_[k].printed = false;
+  }
+
+  void ask(int k, unsigned part, bool first) {
+    if (!send_) return;
+    const uint8_t target = p_[k].clock.target;
+    result_req pr;
+    memset(&pr, 0, sizeof(pr));
+    strncpy(pr.structPassword, pw_, sizeof(pr.structPassword) - 1);
+    pr.packetType   = PT_RESULT_REQ;
+    pr.targetWCB    = target;
+    pr.requesterWCB = me_;
+    pr.kind         = k ? rparts::KIND_ETM : rparts::KIND_STATS;
+    pr.part         = (uint8_t)part;
+    pr.id           = p_[k].askId;
+    for (int i = 0; i < 3; i++) {
+      send_(target, (const uint8_t*)&pr, sizeof(pr));
+      delay(15);
+    }
+    if (first) {
+      config_req req;
+      memset(&req, 0, sizeof(req));
+      strncpy(req.structPassword, pw_, sizeof(req.structPassword) - 1);
+      req.packetType   = k ? PT_ETM_REQ : PT_STATS_REQ;
+      req.targetWCB    = target;
+      req.requesterWCB = me_;
+      send_(target, (const uint8_t*)&req, sizeof(req));
+    }
+  }
+
+  void say(int k, const char* fmt, ...) {
+    char why[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(why, sizeof(why), fmt, ap);
+    va_end(ap);
+    if (out_) out_->printf("[MGMT] %s from WCB%d: %s\n", k ? "ETM characterization results" : "Stats",
+                           (int)p_[k].clock.target, why);
+  }
+};
 
 // ── Who this device is, as the Wizard should see it ─────────────────────────
 struct Identity {
@@ -162,6 +396,15 @@ inline Identity     me;
 inline QueueHandle_t rawQ = nullptr;
 inline FragReasm    reasm;
 inline uint16_t     lastDeliveredSession = 0;   // suppress the CONFIG second pass
+inline ResultPuller puller;                     // ?MGMT,STATS / ETM,CHAR results in parts
+
+inline bool sendRaw(uint8_t target, const uint8_t* data, size_t len) {
+  return wcb && wcb->sendRawPacket(target, data, len);
+}
+inline void startResult(uint8_t kind, int target) {
+  if (target < 1 || target > WCB_MAX_BOARDS) return;
+  puller.start(kind, (uint8_t)target);
+}
 
 inline bool ieq(const char* a, const char* b)     { return strcasecmp(a, b) == 0; }
 inline bool iStarts(const char* s, const char* p) { return strncasecmp(s, p, strlen(p)) == 0; }
@@ -399,8 +642,8 @@ inline bool handleLine(const char* line) {
     memcpy(buf, c + 5, n + 1);
     if      (detail::iStarts(buf, "FRAG,"))     handleMgmtFrag(buf + 5);
     else if (detail::iStarts(buf, "PULL,"))     detail::sendPull(buf + 5);
-    else if (detail::iStarts(buf, "STATS,"))    sendConfigReq((uint8_t)atoi(buf + 6), PT_STATS_REQ,  1);
-    else if (detail::iStarts(buf, "ETM,CHAR,")) sendConfigReq((uint8_t)atoi(buf + 9), PT_ETM_REQ,    1);
+    else if (detail::iStarts(buf, "STATS,"))    detail::startResult(rparts::KIND_STATS, atoi(buf + 6));
+    else if (detail::iStarts(buf, "ETM,CHAR,")) detail::startResult(rparts::KIND_ETM,   atoi(buf + 9));
     return true;
   }
   return false;
@@ -434,7 +677,9 @@ static const unsigned long PART_YIELD_MS = 200;
 //   type 18, body "P..." (a part) -> [MGMT:CFGPART,<src>]<body>
 //   type 18, body "E..." (error)  -> [MGMT:CFGERR,<src>]<body without the E>
 //   type 18, anything else        -> dropped
-// The relay does not join parts: the requester collects the K parts of one id and
+//   type 32 / 33 (a STATS / ETM part, only of a pull this host runs) -> ResultPuller::part,
+//                                    which prints it as the next piece of the one reply
+// The relay does not join config parts: the requester collects the K parts of one id and
 // checks the CRC of the joined text. Mirrors WCB.ino handleConfigFragPacket.
 inline void processConfigFrag(const uint8_t* data) {
   config_frag pkt;
@@ -444,8 +689,10 @@ inline void processConfigFrag(const uint8_t* data) {
   if (pkt.requesterWCB != me.deviceId) return;
   if (pkt.totalChunks == 0 || pkt.totalChunks > MGMT_CHUNKS) return;
   if (pkt.chunkIdx >= MGMT_CHUNKS || pkt.chunkIdx >= pkt.totalChunks) return;
+  const bool result = pkt.packetType == PT_STATS_PART || pkt.packetType == PT_ETM_PART;
   if (pkt.packetType != PT_CONFIG_FRAG && pkt.packetType != PT_STATS_FRAG &&
-      pkt.packetType != PT_ETM_FRAG    && pkt.packetType != PT_CONFIG_PART) return;
+      pkt.packetType != PT_ETM_FRAG    && pkt.packetType != PT_CONFIG_PART && !result) return;
+  if (result && !puller.takes(pkt.packetType, pkt.sourceWCB)) return;   // a part this host did not ask for
   // The 2nd pass. One value covers every reply type: a target that sends parts
   // never gives two consecutive sessions (each part, each error) the same id.
   if (lastDeliveredSession != 0 && pkt.sessionId == lastDeliveredSession) return;
@@ -462,8 +709,9 @@ inline void processConfigFrag(const uint8_t* data) {
     // again on every attempt. So a part frag yields to a live non-part session and
     // is dropped; the part's second pass or the new Wizard's retry recovers it. A
     // non-part frag always takes the slot, exactly as it did before parts existed.
-    if (pkt.packetType == PT_CONFIG_PART && reasm.active &&
-        reasm.packetType != PT_CONFIG_PART &&
+    // A STATS / ETM part yields the same way.
+    const auto isPart = [](uint8_t t) { return t == PT_CONFIG_PART || t == PT_STATS_PART || t == PT_ETM_PART; };
+    if (isPart(pkt.packetType) && reasm.active && !isPart(reasm.packetType) &&
         (millis() - reasm.lastMs) < PART_YIELD_MS) return;
     memset(&reasm, 0, sizeof(reasm));
     reasm.active      = true;
@@ -478,6 +726,8 @@ inline void processConfigFrag(const uint8_t* data) {
     reasm.receivedMask |= (1 << pkt.chunkIdx);
   }
   reasm.lastMs = millis();
+  if (result) puller.heard(pkt.packetType, pkt.sourceWCB, pkt.chunkIdx, reasm.chunks[pkt.chunkIdx],
+                           strlen(reasm.chunks[pkt.chunkIdx]));
 
   const uint16_t expected = (uint16_t)((1 << pkt.totalChunks) - 1);
   if (reasm.receivedMask != expected) return;
@@ -498,6 +748,14 @@ inline void processConfigFrag(const uint8_t* data) {
   }
   body[len] = '\0';
 
+  if (result) {
+    lastDeliveredSession = reasm.sessionId;
+    const uint8_t type = reasm.packetType, src = reasm.sourceWCB;
+    puller.part(type, src, body, len, sizeof(reasm.chunks));   // printed in one write, the next part asked
+    memset(&reasm, 0, sizeof(reasm));
+    return;
+  }
+
   const char* tag  = nullptr;
   const char* text = body;
   if      (reasm.packetType == PT_CONFIG_FRAG) tag = "CONFIG";
@@ -514,6 +772,7 @@ inline void processConfigFrag(const uint8_t* data) {
   // '~'. If printf cannot allocate that buffer it prints nothing at all, and a
   // missing line costs the requester a retry, never a wrong config.
   if (tag) out->printf("[MGMT:%s,%d]%s\n", tag, (int)reasm.sourceWCB, text);
+  puller.whole(reasm.packetType, reasm.sourceWCB);   // a STATS / ETM pull of that board is answered
   memset(&reasm, 0, sizeof(reasm));
 }
 
@@ -546,6 +805,7 @@ inline void service() {
     if      (rp.len == (uint8_t)sizeof(config_frag)) detail::processConfigFrag(rp.data);
     else if (rp.len == (uint8_t)sizeof(remote_term)) detail::processRemoteTerm(rp.data);
   }
+  detail::puller.service(millis());   // a STATS / ETM part lost: ask again; a pull that cannot finish: say so
 }
 
 // ── Setup ───────────────────────────────────────────────────────────────────
@@ -555,6 +815,7 @@ inline bool begin(WCB_Client* client, Print* output, const Identity& identity) {
   detail::wcb = client;
   detail::out = output;
   detail::me  = identity;
+  detail::puller.begin(&detail::sendRaw, output, detail::me.meshPassword, identity.deviceId);
   if (!detail::rawQ) detail::rawQ = xQueueCreate(24, sizeof(detail::RawPkt));
   return detail::rawQ != nullptr;
 }
